@@ -1,0 +1,21 @@
+[package]
+name = "NewReport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dioxus = { version = "0.5", features = ["desktop"] }
+odbc-api = "0.36.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3.31"
+rfd = "0.14"
+winapi = { version = "0.3", features = ["winuser", "libloaderapi", "processthreadsapi", "winnt"] }
+encoding_rs = "0.8"
+tokio = { version = "1", features = ["full"] }
+memmap2 = "0.9"
+toml = "0.8"
+dotenvy = "0.15"
+chrono = "0.4"

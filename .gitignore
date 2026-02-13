@@ -1,0 +1,4 @@
+/target
+relatorios/
+.env
+schema.toml
