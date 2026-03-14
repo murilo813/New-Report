@@ -9,10 +9,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use crate::views::editor::ReportParameter;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ReportConfig {
     query_sql: String,
+    #[serde(default)]
+    parametros: Vec<ReportParameter>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +114,121 @@ fn LogsModal(show: Signal<bool>, on_close: EventHandler<()>) -> Element {
 }
 
 #[component]
+fn ParamsModal(
+    show: Signal<bool>,
+    report_config: Signal<Option<ReportConfig>>,
+    report_path: Signal<String>,
+    on_close: EventHandler<()>,
+    on_generate: EventHandler<(String, String)>, 
+) -> Element {
+    if !show() { return rsx! {}; }
+
+    let config = match report_config.read().clone() {
+        Some(c) => c,
+        None => return rsx! {},
+    };
+
+    let params_for_generate = config.parametros.clone();
+    let query_for_generate = config.query_sql.clone();
+    let params_for_display = config.parametros.clone();
+
+    let mut user_values = use_signal(|| {
+        let mut map = std::collections::HashMap::new();
+        for p in &params_for_display { 
+            let default_val = if p.tipo == "bool" { "false".to_string() } else { p.valor_padrao.clone() };
+            map.insert(p.id.clone(), default_val);
+        }
+        map
+    });
+
+    let mut validation_error = use_signal(|| String::new());
+
+    let handle_generate = move |_| {
+        let mut final_sql = query_for_generate.clone(); 
+        
+        for p in &params_for_generate { 
+            let val = user_values.read().get(&p.id).cloned().unwrap_or_default();
+            
+            if p.requerido && val.trim().is_empty() {
+                validation_error.set(format!("O campo '{}' é obrigatório.", p.nome));
+                return;
+            }
+
+            let replace_target = format!("[{}]", p.id);
+            final_sql = final_sql.replace(&replace_target, &val);
+        }
+
+        validation_error.set(String::new());
+        on_generate.call((report_path.read().clone(), final_sql));
+    };
+
+    let params_list = config.parametros.clone();
+    let has_params = !params_for_display.is_empty();
+
+    rsx! {
+        div { class: "modal-overlay",
+            div { class: "modal-window", style: "width: 400px; padding: 0;",
+                div { class: "modal-header", "Parâmetros do Relatório" }
+                
+                div { class: "modal-body", style: "text-align: left; max-height: 400px; overflow-y: auto; padding: 20px;",
+                    if !validation_error().is_empty() {
+                        div { class: "error-message-box", style: "margin-bottom: 15px;", "{validation_error}" }
+                    }
+
+                    if !has_params {
+                        p { style: "text-align: center; color: #666; font-style: italic;", "Este relatório não requer parâmetros." }
+                    } else {
+                        {params_list.iter().map(|p| {
+                            let p_id = p.id.clone();
+                            let current_val = user_values.read().get(&p.id).cloned().unwrap_or_default();
+                            
+                            rsx! {
+                                div { class: "form-group", style: "margin-bottom: 15px;", key: "{p.id}",
+                                    label { "{p.nome}" if p.requerido { span { style: "color: red;", " *" } } }
+                                    
+                                    if p.tipo == "bool" {
+                                        select {
+                                            class: "input-classic", style: "height: 30px;",
+                                            value: "{current_val}",
+                                            onchange: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); },
+                                            option { value: "false", "Não" }
+                                            option { value: "true", "Sim" }
+                                        }
+                                    } else if p.tipo == "data" {
+                                        input {
+                                            class: "input-classic", r#type: "date", style: "height: 30px;",
+                                            value: "{current_val}",
+                                            oninput: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); }
+                                        }
+                                    } else if p.tipo == "int" || p.tipo == "float" {
+                                        input {
+                                            class: "input-classic", r#type: "number", style: "height: 30px;",
+                                            value: "{current_val}",
+                                            oninput: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); }
+                                        }
+                                    } else {
+                                        input {
+                                            class: "input-classic", r#type: "text", style: "height: 30px;",
+                                            value: "{current_val}",
+                                            oninput: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); }
+                                        }
+                                    }
+                                }
+                            }
+                        })}
+                    }
+                }
+                
+                div { class: "modal-footer", style: "display: flex; gap: 10px;",
+                    button { class: "btn-classic", style: "flex: 1;", onclick: move |_| on_close.call(()), "Cancelar" }
+                    button { class: "btn-classic", style: "flex: 1; background: #0078d4; color: white;", onclick: handle_generate, "Gerar Relatório" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn Home(
     selected_name: String,
     on_select: EventHandler<String>,
@@ -126,6 +244,10 @@ pub fn Home(
     let last_sql = use_signal(|| String::new());
     
     let mut show_logs = use_signal(|| false);
+
+    let mut show_params_modal = use_signal(|| false);
+    let mut current_report_config = use_signal(|| None::<ReportConfig>);
+    let mut current_report_path = use_signal(|| String::new());
 
     let mut is_loading = use_signal(|| false);
     let mut progress = use_signal(|| 0.0f32);
@@ -163,7 +285,7 @@ pub fn Home(
         }
     });
 
-    let open_report = move |path_to_open: String| {
+    let prepare_report = move |path_to_open: String| {
         let content = match fs::read_to_string(&path_to_open) {
             Ok(c) => c,
             Err(e) => {
@@ -182,6 +304,14 @@ pub fn Home(
             }
         };
 
+        current_report_config.set(Some(config));
+        current_report_path.set(path_to_open);
+        show_params_modal.set(true); 
+    };
+
+    let execute_report = move |(path_to_open, final_sql): (String, String)| {
+        show_params_modal.set(false); // Fecha o modal
+
         let (tx, rx) = mpsc::channel();
         tx_signal.set(Some(tx.clone()));
         rx_signal.set(Some(rx));
@@ -190,7 +320,7 @@ pub fn Home(
         progress.set(0.0);
         cancel_flag.read().store(false, Ordering::SeqCst);
 
-        let sql_to_process = config.query_sql.clone();
+        let sql_to_process = final_sql.clone();
         let current_cancel = cancel_flag.read().clone();
         let report_name_log = path_to_open.clone(); 
 
@@ -198,7 +328,6 @@ pub fn Home(
             let mut new_engine = DataEngine::new();
             let tx_progress = tx.clone();
 
-            // INÍCIO DO CRONÔMETRO (Fase 1)
             let start_time = std::time::Instant::now();
 
             let result = new_engine.process_report_with_progress(
@@ -258,6 +387,14 @@ pub fn Home(
                 on_close: move |_| show_logs.set(false)
             }
 
+            ParamsModal {
+                show: show_params_modal,
+                report_config: current_report_config,
+                report_path: current_report_path,
+                on_close: move |_| show_params_modal.set(false),
+                on_generate: execute_report
+            }
+
             div { class: "middle-section",
                 div { class: "sidebar",
                     button { class: "btn-classic", onclick: move |_| {
@@ -284,7 +421,7 @@ pub fn Home(
                     }
                     div { class: "tree-container",
                         ul { class: "tree-list",
-                            {render_tree(&filtered_items, &selected_name, on_select, EventHandler::new(open_report))}
+                            {render_tree(&filtered_items, &selected_name, on_select, EventHandler::new(prepare_report))}
                         }
                     }
                 }
