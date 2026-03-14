@@ -17,6 +17,7 @@ pub struct Column {
     pub name: String,
     pub field_type: String,
     pub offset: u32,
+    pub length: u32,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -32,13 +33,26 @@ pub struct DataEngine {
 }
 
 impl DataEngine {
-    pub fn new() -> Self {
-        dotenv().ok();
+    pub fn new_empty() -> Self {
+        Self {
+            sqlite: SqliteConn::open_in_memory().unwrap(),
+            schema: BTreeMap::new(),
+            base_path: String::new(),
+        }
+    }
 
-        let db_path = "zecao.db";
-        let conn = SqliteConn::open(db_path).expect("Falha ao abrir arquivo de banco");
+    pub fn new() -> Self {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                dotenvy::from_path(dir.join(".env")).ok();
+            }
+        }
+        dotenv().ok(); 
+
+        let conn = SqliteConn::open_in_memory().expect("Falha ao abrir SQLite na RAM");
         
-        let base_path = env::var("DATABASE_PATH")
+        let base_path = env::var("DB_PATH")
+            .map(|v| v.replace('"', ""))
             .unwrap_or_else(|_| r"C:\BmSoft\Bases\zecao".to_string());
 
         let toml_content = std::fs::read_to_string("schema.toml")
@@ -124,7 +138,8 @@ impl DataEngine {
                     "I" => "INTEGER",
                     "F" => "REAL",
                     "D" => "TEXT",
-                    _ => "TEXT",
+                    "B" => "TEXT", 
+                    "S" | _ => "TEXT",
                 };
                 col_defs.push(format!("\"{}\" {}", col.name, dtype));
             }
@@ -155,57 +170,57 @@ impl DataEngine {
         let data_offset = 0x200 + (total_fields * 768);
         let total_rows_expected = u32::from_le_bytes(mmap[0x29..0x2D].try_into().unwrap());
 
-
         let placeholders = vec!["?"; target_cols.len()].join(", ");
         let insert_sql = format!("INSERT INTO {} VALUES ({})", table_name, placeholders);
 
         let tx = self.sqlite.transaction().map_err(|e| e.to_string())?;
         let mut count = 0;
+        
         {
-            let mut stmt = tx.prepare(&insert_sql).map_err(|e| e.to_string())?;
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?; // Cache de instrução
             let mut i = data_offset;
 
             while i + config.record_size as usize <= mmap.len() {
                 if cancel_flag.load(Ordering::SeqCst) { return Err("Cancelado".to_string()); }
-                let row_data = &mmap[i..i + config.record_size as usize];
+                
+                if let Some(row_data) = mmap.get(i..i + config.record_size as usize) {
+                    if row_data[0] == 0 { 
+                        stmt.execute(rusqlite::params_from_iter(target_cols.iter().map(|col| {
+                            let start = col.offset as usize + 1;
+                            let end = start + col.length as usize;
 
-                if row_data[0] == 0 {
-                    let mut params = Vec::with_capacity(target_cols.len());
-                    for col in target_cols {
-                        let start = col.offset as usize + 1;
-                        match col.field_type.as_str() {
-                            "I" => {
-                                let val = i32::from_le_bytes(row_data[start..start+4].try_into().unwrap_or([0;4]));
-                                
-                                params.push(rusqlite::types::Value::Integer(val as i64));
-                            },
-                            "F" => {
-                                let val = f64::from_le_bytes(row_data[start..start+8].try_into().unwrap_or([0;8]));
-                                params.push(rusqlite::types::Value::Real(val));
-                            },
-                            "D" => {
-                                let days = i32::from_le_bytes(row_data[start..start+4].try_into().unwrap_or([0;4]));
-                                if days > 0 {
-                                    params.push(rusqlite::types::Value::Text(convert_dbisam_to_iso(days)));
-                                } else {
-                                    params.push(rusqlite::types::Value::Null);
+                            match col.field_type.as_str() {
+                                "I" => {
+                                    let val = i32::from_le_bytes(row_data.get(start..start+4).and_then(|s| s.try_into().ok()).unwrap_or([0;4]));
+                                    rusqlite::types::Value::Integer(val as i64)
+                                },
+                                "F" => {
+                                    let val = f64::from_le_bytes(row_data.get(start..start+8).and_then(|s| s.try_into().ok()).unwrap_or([0;8]));
+                                    rusqlite::types::Value::Real(val)
+                                },
+                                "D" => {
+                                    let days = i32::from_le_bytes(row_data.get(start..start+4).and_then(|s| s.try_into().ok()).unwrap_or([0;4]));
+                                    if days > 0 { rusqlite::types::Value::Text(convert_dbisam_to_iso(days)) } 
+                                    else { rusqlite::types::Value::Null }
+                                },
+                                _ => {
+                                    if let Some(slice) = row_data.get(start..end) {
+                                        rusqlite::types::Value::Text(Self::decode_db_string(slice))
+                                    } else {
+                                        rusqlite::types::Value::Null
+                                    }
                                 }
-                            },
-                            _ => {
-                                let end = calculate_string_end(config, col, row_data.len());
-                                let text = Self::decode_db_string(&row_data[start..end]);
-                                
-                                params.push(rusqlite::types::Value::Text(text));
                             }
-                        }
+                        }))).map_err(|e| e.to_string())?;
+                        
+                        count += 1;
                     }
-                    stmt.execute(params_from_iter(params)).map_err(|e| e.to_string())?;
-                    count += 1;
                 }
                 i += config.record_size as usize;
                 if count >= total_rows_expected { break; }
             }
         }
+        
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -220,26 +235,13 @@ impl DataEngine {
 
         for i in 0..(commands.len() - 1) {
             let cmd = commands[i];
-            
             self.sqlite.execute(cmd, []).map_err(|e| format!("Erro no comando {}: {}", cmd, e))?;
-            
             let _ = self.sqlite.execute("PRAGMA schema_version", []); 
         }
 
         let last_query = commands.last().unwrap();
-        
         self.sqlite.prepare(last_query).map_err(|e| format!("Erro no SELECT final: {}", e))
     }
-}
-
-fn calculate_string_end(config: &TableConfig, current_col: &Column, row_len: usize) -> usize {
-    let mut next_offset = row_len as u32;
-    for c in &config.columns {
-        if c.offset > current_col.offset && c.offset < next_offset {
-            next_offset = c.offset;
-        }
-    }
-    next_offset as usize
 }
 
 fn convert_dbisam_to_iso(days: i32) -> String {
