@@ -12,6 +12,8 @@ pub fn ViewReport(
     let mut show_error = use_signal(|| false);
     let error_msg = use_signal(|| String::new());
 
+    let mut max_visible = use_signal(|| 1000);
+
     let sql_limpo = query_sql
         .lines()
         .filter(|line| !line.trim().to_uppercase().contains("[SYNC:"))
@@ -36,7 +38,7 @@ pub fn ViewReport(
 
                 let rows_iter = stmt
                     .query_map([], |row| {
-                        let mut row_data = Vec::new();
+                        let mut row_data = Vec::with_capacity(col_count);
                         for i in 0..col_count {
                             let val = row.get_ref(i).unwrap();
                             row_data.push(match val {
@@ -58,7 +60,18 @@ pub fn ViewReport(
         }
     });
 
-    let (headers, rows) = report_data.read().clone();
+    let (headers, all_rows) = report_data.read().clone();
+    let total_rows = all_rows.len();
+
+    let end_idx = max_visible().min(total_rows);
+    let visible_rows = if total_rows > 0 { &all_rows[0..end_idx] } else { &[] };
+    let displayed_count = visible_rows.len();
+
+    let status_text = if total_rows == 0 {
+        "Nenhum registro encontrado".to_string()
+    } else {
+        format!("Exibindo {} de {} registros", displayed_count, total_rows)
+    };
 
     rsx! {
         div { class: "app-container",
@@ -83,7 +96,7 @@ pub fn ViewReport(
                         span { class: "folder-name", "Visualização de Dados" }
                     }
 
-                    div { class: "data-container",
+                    div { class: "data-container", style: "overflow-y: auto;",
                         table { class: "pg-table table-wrapper",
                             thead {
                                 tr {
@@ -93,7 +106,7 @@ pub fn ViewReport(
                                 }
                             }
                             tbody {
-                                {rows.iter().enumerate().map(|(i, row)| rsx! {
+                                {visible_rows.iter().enumerate().map(|(i, row)| rsx! {
                                     tr { key: "{i}",
                                         {row.iter().enumerate().map(|(j, cell)| rsx! {
                                             td { key: "{j}", "{cell}" }
@@ -102,11 +115,21 @@ pub fn ViewReport(
                                 })}
                             }
                         }
+                        
+                        if displayed_count < total_rows {
+                            div {
+                                style: "text-align: center; padding: 20px; background: var(--bg-color-light); cursor: pointer; font-weight: bold; border-top: 1px solid var(--border-color);",
+                                onclick: move |_| {
+                                    max_visible += 1000;
+                                },
+                                "⬇️ Rolar para carregar mais registros..."
+                            }
+                        }
                     }
                 }
             }
             div { class: "status-bar-container",
-                span { "Total de registros: {rows.len()}" }
+                span { "{status_text}" }
             }
         }
     }
