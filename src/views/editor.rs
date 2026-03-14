@@ -1,4 +1,5 @@
 use crate::components::error_modal::SqlErrorModal;
+use crate::core::engine::DataEngine;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -76,14 +77,88 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
     };
 
     let handle_test = move |_| {
-        let env = odbc_api::Environment::new().unwrap();
-        match env.connect_with_connection_string("DSN=DBISAM;SilentMode=True;") {
-            Ok(_) => show_success.set(true),
-            Err(e) => {
-                error_msg.set(format!("Falha na conexão DBISAM: {}", e));
-                show_error.set(true);
+        let sql = query_text.read().clone();
+
+        if !sql.to_uppercase().contains("[SYNC:") {
+            error_msg.set("ERRO: Tag [SYNC: ...] não encontrada na query.".to_string());
+            show_error.set(true);
+            return;
+        }
+
+        let engine = DataEngine::new();
+        let conn = &engine.sqlite;
+
+        let re_header = regex::Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
+        let re_table = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\((.*?)\)").unwrap();
+
+        let mut tables_to_mock = Vec::new();
+        if let Some(content) = re_header.captures(&sql).and_then(|caps| caps.get(1)) {
+            for cap in re_table.captures_iter(content.as_str()) {
+                tables_to_mock.push(cap[1].to_string().to_lowercase());
             }
         }
+
+        if tables_to_mock.is_empty() {
+            error_msg.set(
+                "Tag SYNC encontrada, mas nenhuma tabela foi declarada corretamente.".to_string(),
+            );
+            show_error.set(true);
+            return;
+        }
+
+        for table_name in tables_to_mock {
+            match engine
+                .schema
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == table_name)
+            {
+                Some((_, config)) => {
+                    let mut col_defs = Vec::new();
+                    for col in &config.columns {
+                        let dtype = match col.field_type.as_str() {
+                            "I" => "INTEGER",
+                            "F" => "REAL",
+                            _ => "TEXT",
+                        };
+                        col_defs.push(format!("\"{}\" {}", col.name, dtype));
+                    }
+                    let create_sql =
+                        format!("CREATE TABLE {} ({})", table_name, col_defs.join(", "));
+                    let _ = conn.execute(&create_sql, []);
+                }
+                None => {
+                    error_msg.set(format!(
+                        "Tabela '{}' não existe no arquivo schema.toml!",
+                        table_name
+                    ));
+                    show_error.set(true);
+                    return;
+                }
+            }
+        }
+
+        let clean_sql = re_header.replace_all(&sql, "").to_string();
+        let commands: Vec<&str> = clean_sql
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if commands.is_empty() {
+            error_msg.set("O SQL está vazio após a tag de sincronização.".to_string());
+            show_error.set(true);
+            return;
+        }
+
+        for cmd in commands {
+            if let Err(e) = conn.prepare(cmd) {
+                error_msg.set(format!("Erro de Sintaxe no SQL:\n{}", e));
+                show_error.set(true);
+                return;
+            }
+        }
+
+        show_success.set(true);
     };
 
     let report_name_original = report_name.clone();
@@ -140,11 +215,12 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
         if show_success() {
           div { class: "modal-overlay",
             div { class: "modal-window",
-              div { class: "modal-header", "Sucesso" }
+              div { class: "modal-header", "Validação Concluída" } 
               div { class: "modal-body",
                 div { class: "test-ok",
                   span { class: "success-icon", "✅" }
-                  p { "Conexão DBISAM ativa!" }
+                  p { "SQL Validado com Sucesso!" }
+                  p { style: "font-size: 0.9em; color: var(--text-muted);", "Sintaxe e tabelas do SYNC estão corretas." }
                 }
               }
               div { class: "modal-footer",
@@ -158,7 +234,7 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
           div { class: "sidebar",
             button { class: "btn-classic", onclick: save_and_exit, "Salvar e Sair" }
             button { class: "btn-classic", onclick: move |e| on_back.call(e), "Cancelar" }
-            button { class: "btn-classic", onclick: handle_test, "Testar Conexão" }
+            button { class: "btn-classic", onclick: handle_test, "Testar Query" } 
           }
 
           div { class: "main-view",
@@ -192,8 +268,8 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
               } else {
                 div { class: "sql-editor-container",
                    div { class: "sql-instruction",
-                        span { "Defina as tabelas. Ex: " }
-                        code { "-- [SYNC: nfmestre(*), pessoas(id, nome)]" }
+                       span { "Defina as tabelas. Ex: " }
+                       code { "-- [SYNC: nfmestre(*), pessoas(id, nome)]" }
                    }
                   textarea {
                     class: "sql-editor",
