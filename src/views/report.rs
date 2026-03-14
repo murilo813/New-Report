@@ -16,7 +16,7 @@ pub fn ViewReport(
 
     let sql_to_query = query_sql.clone();
 
-    let report_data = use_memo(move || {
+    let report_data = use_signal(move || {
         let engine_handle = engine.read();
 
         let start_time = std::time::Instant::now();
