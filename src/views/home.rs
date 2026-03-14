@@ -142,6 +142,11 @@ fn ParamsModal(
     });
 
     let mut validation_error = use_signal(|| String::new());
+    
+    let mut show_lookup = use_signal(|| false);
+    let mut lookup_data = use_signal(|| (Vec::<String>::new(), Vec::<Vec<String>>::new()));
+    let mut lookup_active_param = use_signal(|| String::new());
+    let mut is_lookup_loading = use_signal(|| false);
 
     let handle_generate = move |_| {
         let mut final_sql = query_for_generate.clone(); 
@@ -164,6 +169,7 @@ fn ParamsModal(
 
     let params_list = config.parametros.clone();
     let has_params = !params_for_display.is_empty();
+    let (lookup_headers, lookup_rows) = lookup_data.read().clone();
 
     rsx! {
         div { class: "modal-overlay",
@@ -206,6 +212,86 @@ fn ParamsModal(
                                             value: "{current_val}",
                                             oninput: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); }
                                         }
+                                    } else if p.tipo == "pesquisa" {
+                                        div { style: "display: flex; gap: 5px; align-items: center;",
+                                            input {
+                                                class: "input-classic", r#type: "text", style: "height: 30px; flex: 1;",
+                                                value: "{current_val}",
+                                                oninput: move |evt| { user_values.write().insert(p_id.clone(), evt.value()); }
+                                            }
+                                            button {
+                                                class: "btn-classic", style: "height: 30px; min-width: 40px; padding: 0 10px;",
+                                                disabled: *is_lookup_loading.read() && *lookup_active_param.read() == p.id,
+                                                onclick: {
+                                                    let param_id = p.id.clone();
+                                                    let extra_sql = p.extra.clone();
+                                                    move |_| {
+                                                        if extra_sql.trim().is_empty() {
+                                                            validation_error.set("A query de pesquisa (Parâmetros Extras) está vazia.".to_string());
+                                                            return;
+                                                        }
+                                                        validation_error.set(String::new());
+                                                        lookup_active_param.set(param_id.clone());
+                                                        is_lookup_loading.set(true);
+                                                        
+                                                        let sql_for_spawn = extra_sql.clone();
+                                                        
+                                                        spawn(async move {
+                                                            let (tx, rx) = std::sync::mpsc::channel();
+                                                            let sql_clone = sql_for_spawn; 
+                                                            
+                                                            std::thread::spawn(move || {
+                                                                let mut tmp_engine = DataEngine::new();
+                                                                let cancel = Arc::new(AtomicBool::new(false));
+                                                                
+                                                                if let Ok(_) = tmp_engine.process_report_with_progress(&sql_clone, cancel, |_| {}) {
+                                                                    if let Ok(mut stmt) = tmp_engine.execute_user_sql(&sql_clone) {
+                                                                        let cols: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+                                                                        let col_count = stmt.column_count();
+                                                                        
+                                                                        let rows_iter = stmt.query_map([], |row| {
+                                                                            let mut r = Vec::with_capacity(col_count);
+                                                                            for i in 0..col_count {
+                                                                                let val = row.get_ref(i).unwrap();
+                                                                                r.push(match val {
+                                                                                    rusqlite::types::ValueRef::Null => "".to_string(),
+                                                                                    rusqlite::types::ValueRef::Integer(v) => v.to_string(),
+                                                                                    rusqlite::types::ValueRef::Real(v) => format!("{:.2}", v),
+                                                                                    rusqlite::types::ValueRef::Text(v) => String::from_utf8_lossy(v).to_string(),
+                                                                                    _ => "[BIN]".to_string(),
+                                                                                });
+                                                                            }
+                                                                            Ok(r)
+                                                                        }).unwrap();
+                                                                        
+                                                                        let rows: Vec<Vec<String>> = rows_iter.filter_map(|r| r.ok()).collect();
+                                                                        let _ = tx.send(Ok((cols, rows)));
+                                                                        return;
+                                                                    }
+                                                                }
+                                                                let _ = tx.send(Err("Erro ao processar SQL de pesquisa. Verifique o uso correto da tag SYNC.".to_string()));
+                                                            });
+
+                                                            loop {
+                                                                if let Ok(res) = rx.try_recv() {
+                                                                    match res {
+                                                                        Ok(data) => {
+                                                                            lookup_data.set(data);
+                                                                            show_lookup.set(true);
+                                                                        }
+                                                                        Err(e) => validation_error.set(e),
+                                                                    }
+                                                                    is_lookup_loading.set(false);
+                                                                    break;
+                                                                }
+                                                                tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+                                                            }
+                                                        });
+                                                    }
+                                                },
+                                                if *is_lookup_loading.read() && *lookup_active_param.read() == p.id { "⏳" } else { "🔍" }
+                                            }
+                                        }
                                     } else {
                                         input {
                                             class: "input-classic", r#type: "text", style: "height: 30px;",
@@ -222,6 +308,45 @@ fn ParamsModal(
                 div { class: "modal-footer", style: "display: flex; gap: 10px;",
                     button { class: "btn-classic", style: "flex: 1;", onclick: move |_| on_close.call(()), "Cancelar" }
                     button { class: "btn-classic", style: "flex: 1; background: #0078d4; color: white;", onclick: handle_generate, "Gerar Relatório" }
+                }
+            }
+
+            if show_lookup() {
+                div { class: "modal-overlay", style: "z-index: 1000; background: rgba(0,0,0,0.6);",
+                    div { class: "modal-window", style: "width: 600px; max-height: 80vh; display: flex; flex-direction: column; padding: 0;",
+                        div { class: "modal-header", "Selecione uma opção" }
+                        div { class: "modal-body", style: "flex: 1; overflow-y: auto; padding: 0; background: var(--bg-color-light);",
+                            table { class: "pg-table table-wrapper", style: "width: 100%; border-collapse: collapse;",
+                                thead {
+                                    tr {
+                                        {lookup_headers.iter().map(|h| rsx! { th { key: "{h}", class: "sticky-header", "{h}" } })}
+                                    }
+                                }
+                                tbody {
+                                    {lookup_rows.iter().enumerate().map(|(i, row)| {
+                                        let row_id = row.get(0).cloned().unwrap_or_default();
+                                        rsx! {
+                                            tr { 
+                                                key: "{i}",
+                                                style: "cursor: pointer; border-bottom: 1px solid var(--border-color);",
+                                                onclick: move |_| {
+                                                    user_values.write().insert(lookup_active_param(), row_id.clone());
+                                                    show_lookup.set(false);
+                                                },
+                                                {row.iter().map(|cell| rsx! { td { style: "padding: 8px;", "{cell}" } })}
+                                            }
+                                        }
+                                    })}
+                                }
+                            }
+                            if lookup_rows.is_empty() {
+                                div { style: "padding: 20px; text-align: center; color: #888;", "Nenhum resultado encontrado." }
+                            }
+                        }
+                        div { class: "modal-footer",
+                            button { class: "btn-classic", onclick: move |_| show_lookup.set(false), "Cancelar" }
+                        }
+                    }
                 }
             }
         }

@@ -245,7 +245,7 @@ impl DataEngine {
 
         drop(tx);
 
-        let mut db_tx = self.sqlite.transaction().map_err(|e| e.to_string())?;
+        let db_tx = self.sqlite.transaction().map_err(|e| e.to_string())?;
         let mut total_processed = 0;
         let mut final_error = None;
 

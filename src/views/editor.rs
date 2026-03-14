@@ -12,6 +12,8 @@ pub struct ReportParameter {
     pub tipo: String, 
     pub valor_padrao: String,
     pub requerido: bool,
+    #[serde(default)] // Garante compatibilidade com os relatórios antigos
+    pub extra: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -335,7 +337,8 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                                                     nome: "Novo Parâmetro".to_string(), 
                                                     tipo: "string".to_string(),
                                                     valor_padrao: "".to_string(), 
-                                                    requerido: true 
+                                                    requerido: true,
+                                                    extra: "".to_string()
                                                 });
                                                 selected_param_idx.set(Some(new_idx));
                                             },
@@ -384,6 +387,7 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                                                     option { value: "int", "Inteiro (Número Exato)" }
                                                     option { value: "float", "Decimal (Moeda / Quantidade)" }
                                                     option { value: "data", "Data" }
+                                                    option { value: "pesquisa", "Pesquisa (Busca com SQL)" }
                                                 }
                                             }
                                             div { class: "form-group",
@@ -403,6 +407,18 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                                                     }
                                                 }
                                                 label { style: "margin: 0; cursor: pointer;", "Campo Obrigatório" }
+                                            }
+                                            
+                                            div { class: "form-group", style: "margin-top: 15px;",
+                                                label { "Parâmetros Extras (Ex: SQL de pesquisa com tag [SYNC: ...])" }
+                                                textarea { 
+                                                    class: "input-classic", 
+                                                    style: "height: 80px; resize: vertical; font-family: monospace;", 
+                                                    value: "{parameters.read()[idx].extra}", 
+                                                    oninput: move |evt| {
+                                                        if let Some(i) = sel_idx { parameters.write()[i].extra = evt.value(); }
+                                                    } 
+                                                }
                                             }
                                         }
                                     } else {
