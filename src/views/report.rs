@@ -1,5 +1,5 @@
 use crate::components::error_modal::SqlErrorModal;
-use crate::core::engine::DataEngine;
+use crate::core::engine::{DataEngine, append_log};
 use dioxus::prelude::*;
 use rusqlite::types::ValueRef;
 
@@ -19,7 +19,9 @@ pub fn ViewReport(
     let report_data = use_memo(move || {
         let engine_handle = engine.read();
 
-        match engine_handle.execute_user_sql(&sql_to_query) {
+        let start_time = std::time::Instant::now();
+
+        let res = match engine_handle.execute_user_sql(&sql_to_query) {
             Ok(mut stmt) => {
                 let cols: Vec<String> = stmt
                     .column_names()
@@ -52,10 +54,14 @@ pub fn ViewReport(
             Err(e) => {
                 (vec!["ERRO".to_string()], vec![vec![e]])
             }
-        }
+        };
+
+        let elapsed_ms = start_time.elapsed().as_millis();
+        append_log("Visualização do Relatório", "Execução da Query SQLite e Renderização", elapsed_ms);
+
+        res
     });
 
-    // --- FUNÇÃO DE EXPORTAR CSV ---
     let (headers, all_rows) = report_data.read().clone();
     let total_rows = all_rows.len();
     
@@ -108,39 +114,21 @@ pub fn ViewReport(
 
             div { class: "middle-section",
                 div { class: "sidebar",
-                    button {
-                        class: "btn-classic",
-                        onclick: move |evt| on_back.call(evt),
-                        "🏠 Voltar"
-                    }
-                    
-                    button {
-                        class: "btn-classic",
-                        onclick: export_csv,
-                        "💾 Exportar CSV"
-                    }
+                    button { class: "btn-classic", onclick: move |evt| on_back.call(evt), "🏠 Voltar" }
+                    button { class: "btn-classic", onclick: export_csv, "💾 Exportar CSV" }
                 }
 
                 div { class: "main-view report-view-container",
-                    div { class: "top-toolbar",
-                        span { class: "folder-name", "Visualização de Dados" }
-                    }
-
+                    div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados" } }
                     div { class: "data-container", style: "overflow-y: auto;",
                         table { class: "pg-table table-wrapper",
                             thead {
-                                tr {
-                                    {headers.iter().map(|h| rsx! {
-                                        th { key: "{h}", class: "sticky-header", "{h}" }
-                                    })}
-                                }
+                                tr { {headers.iter().map(|h| rsx! { th { key: "{h}", class: "sticky-header", "{h}" } })} }
                             }
                             tbody {
                                 {visible_rows.iter().enumerate().map(|(i, row)| rsx! {
                                     tr { key: "{i}",
-                                        {row.iter().enumerate().map(|(j, cell)| rsx! {
-                                            td { key: "{j}", "{cell}" }
-                                        })}
+                                        {row.iter().enumerate().map(|(j, cell)| rsx! { td { key: "{j}", "{cell}" } })}
                                     }
                                 })}
                             }
@@ -149,18 +137,14 @@ pub fn ViewReport(
                         if displayed_count < total_rows {
                             div {
                                 style: "text-align: center; padding: 20px; background: var(--bg-color-light); cursor: pointer; font-weight: bold; border-top: 1px solid var(--border-color);",
-                                onclick: move |_| {
-                                    max_visible += 1000;
-                                },
+                                onclick: move |_| { max_visible += 1000; },
                                 "⬇️ Rolar para carregar mais registros..."
                             }
                         }
                     }
                 }
             }
-            div { class: "status-bar-container",
-                span { "{status_text}" }
-            }
+            div { class: "status-bar-container", span { "{status_text}" } }
         }
     }
 }

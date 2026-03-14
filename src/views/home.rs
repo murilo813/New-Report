@@ -1,5 +1,5 @@
 use crate::components::error_modal::SqlErrorModal;
-use crate::core::engine::DataEngine;
+use crate::core::engine::{DataEngine, append_log};
 use dioxus::prelude::*;
 use serde::Deserialize;
 use std::fs;
@@ -63,17 +63,14 @@ fn read_reports(dir: &Path) -> Vec<FileItem> {
 }
 
 fn filter_nodes(items: &[FileItem], query: &str) -> Vec<FileItem> {
-    if query.is_empty() {
-        return items.to_vec();
-    }
+    if query.is_empty() { return items.to_vec(); }
     let lower_query = query.to_lowercase();
     items
         .iter()
         .filter_map(|item| {
             if item.is_dir {
                 let filtered_children = filter_nodes(&item.children, query);
-                if !filtered_children.is_empty() || item.name.to_lowercase().contains(&lower_query)
-                {
+                if !filtered_children.is_empty() || item.name.to_lowercase().contains(&lower_query) {
                     let mut new_dir = item.clone();
                     new_dir.children = filtered_children;
                     return Some(new_dir);
@@ -87,16 +84,30 @@ fn filter_nodes(items: &[FileItem], query: &str) -> Vec<FileItem> {
 }
 
 fn count_files(items: &[FileItem]) -> usize {
-    items
-        .iter()
-        .map(|item| {
-            if item.is_dir {
-                count_files(&item.children)
-            } else {
-                1
+    items.iter().map(|item| if item.is_dir { count_files(&item.children) } else { 1 }).sum()
+}
+
+#[component]
+fn LogsModal(show: Signal<bool>, on_close: EventHandler<()>) -> Element {
+    if !show() { return rsx! {}; }
+    
+    let logs_content = std::fs::read_to_string("logs_desempenho.txt")
+        .unwrap_or_else(|_| "Nenhum log de desempenho encontrado ainda...".to_string());
+
+    rsx! {
+        div { class: "modal-overlay", style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 9999;",
+            div { class: "modal-content", style: "background: var(--bg-color-dark, #1e1e1e); padding: 20px; border-radius: 8px; border: 1px solid var(--border-color); width: 80%; height: 80%; display: flex; flex-direction: column;",
+                h2 { style: "color: var(--text-color); margin-top: 0;", "📜 Histórico de Desempenho (Logs)" }
+                textarea {
+                    class: "input-classic",
+                    style: "flex: 1; resize: none; font-family: monospace; background: #000; color: #0f0; padding: 10px; margin-bottom: 15px; border-radius: 4px;",
+                    readonly: true,
+                    value: "{logs_content}"
+                }
+                button { class: "btn-classic", style: "align-self: flex-end;", onclick: move |_| on_close.call(()), "✖ Fechar Logs" }
             }
-        })
-        .sum()
+        }
+    }
 }
 
 #[component]
@@ -113,6 +124,8 @@ pub fn Home(
     let mut show_error = use_signal(|| false);
     let mut error_msg = use_signal(|| String::new());
     let last_sql = use_signal(|| String::new());
+    
+    let mut show_logs = use_signal(|| false);
 
     let mut is_loading = use_signal(|| false);
     let mut progress = use_signal(|| 0.0f32);
@@ -179,18 +192,25 @@ pub fn Home(
 
         let sql_to_process = config.query_sql.clone();
         let current_cancel = cancel_flag.read().clone();
+        let report_name_log = path_to_open.clone(); 
 
         std::thread::spawn(move || {
             let mut new_engine = DataEngine::new();
             let tx_progress = tx.clone();
 
+            // INÍCIO DO CRONÔMETRO (Fase 1)
+            let start_time = std::time::Instant::now();
+
             let result = new_engine.process_report_with_progress(
                 &sql_to_process,
                 current_cancel,
-                move |p| {
-                    let _ = tx_progress.send(LoaderMsg::Progress(p));
-                },
+                move |p| { let _ = tx_progress.send(LoaderMsg::Progress(p)); },
             );
+
+            let elapsed_ms = start_time.elapsed().as_millis();
+            if result.is_ok() {
+                append_log(&report_name_log, "Processamento DBISAM -> RAM SQLite", elapsed_ms);
+            }
 
             match result {
                 Ok(_) => {
@@ -232,6 +252,11 @@ pub fn Home(
                 sql_content: last_sql(),
                 on_close: move |_| show_error.set(false)
             }
+            
+            LogsModal {
+                show: show_logs,
+                on_close: move |_| show_logs.set(false)
+            }
 
             div { class: "middle-section",
                 div { class: "sidebar",
@@ -241,6 +266,9 @@ pub fn Home(
                     }, "✚ Novo" }
                     button { class: "btn-classic", onclick: move |_| on_edit.call(()), "✎ Editar" }
                     button { class: "btn-classic", onclick: delete_selected, "✖ Excluir" }
+                    
+                    div { style: "margin-top: auto;" } 
+                    button { class: "btn-classic", style: "background-color: #3a3a3a;", onclick: move |_| show_logs.set(true), "📜 Logs" }
                 }
 
                 div { class: "main-view",

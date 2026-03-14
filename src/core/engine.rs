@@ -1,7 +1,7 @@
 use encoding_rs::WINDOWS_1252;
 use memmap2::Mmap;
 use regex::Regex;
-use rusqlite::{Connection as SqliteConn};
+use rusqlite::Connection as SqliteConn;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -11,6 +11,7 @@ use std::sync::{
 };
 use dotenvy::dotenv;
 use std::env;
+use std::io::Write; 
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Column {
@@ -177,7 +178,7 @@ impl DataEngine {
         let mut count = 0;
         
         {
-            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?; // Cache de instrução
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
             let mut i = data_offset;
 
             while i + config.record_size as usize <= mmap.len() {
@@ -226,7 +227,7 @@ impl DataEngine {
     }
 
     pub fn execute_user_sql(&self, sql: &str) -> Result<rusqlite::Statement<'_>, String> {
-        let re_sync = Regex::new(r"(?i)\[SYNC:.*?\]").unwrap();
+        let re_sync = Regex::new(r"(?i)\[SYNC:\s*(?s).*?\]").unwrap();
         let clean_sql = re_sync.replace_all(sql, "").to_string();
 
         let commands: Vec<&str> = clean_sql.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
@@ -252,4 +253,13 @@ fn convert_dbisam_to_iso(days: i32) -> String {
         return datetime.format("%Y-%m-%d").to_string();
     }
     "0001-01-01".to_string()
+}
+
+pub fn append_log(report_name: &str, stage: &str, duration_ms: u128) {
+    let now = chrono::Local::now().format("%d/%m/%Y %H:%M:%S");
+    let log_line = format!("(RELATÓRIO: {} | {}) -> {} levou {} ms\n", report_name, now, stage, duration_ms);
+    
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("logs_desempenho.txt") {
+        let _ = file.write_all(log_line.as_bytes());
+    }
 }
