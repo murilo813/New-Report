@@ -1,7 +1,7 @@
 use encoding_rs::WINDOWS_1252;
 use memmap2::Mmap;
 use regex::Regex;
-use rusqlite::{Connection as SqliteConn, params_from_iter};
+use rusqlite::{Connection as SqliteConn};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -225,7 +225,7 @@ impl DataEngine {
         Ok(())
     }
 
-    pub fn execute_user_sql(&self, sql: &str) -> Result<rusqlite::Statement, String> {
+    pub fn execute_user_sql(&self, sql: &str) -> Result<rusqlite::Statement<'_>, String> {
         let re_sync = Regex::new(r"(?i)\[SYNC:.*?\]").unwrap();
         let clean_sql = re_sync.replace_all(sql, "").to_string();
 

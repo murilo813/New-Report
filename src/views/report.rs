@@ -10,23 +10,16 @@ pub fn ViewReport(
     query_sql: String,
 ) -> Element {
     let mut show_error = use_signal(|| false);
-    let error_msg = use_signal(|| String::new());
+    let mut error_msg = use_signal(|| String::new()); 
 
     let mut max_visible = use_signal(|| 1000);
 
-    let sql_limpo = query_sql
-        .lines()
-        .filter(|line| !line.trim().to_uppercase().contains("[SYNC:"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let sql_to_query = sql_limpo.clone();
+    let sql_to_query = query_sql.clone();
 
     let report_data = use_memo(move || {
         let engine_handle = engine.read();
-        let conn = &engine_handle.sqlite;
 
-        match conn.prepare(&sql_to_query) {
+        match engine_handle.execute_user_sql(&sql_to_query) {
             Ok(mut stmt) => {
                 let cols: Vec<String> = stmt
                     .column_names()
@@ -56,12 +49,43 @@ pub fn ViewReport(
                 let rows_vec: Vec<Vec<String>> = rows_iter.filter_map(|r| r.ok()).collect();
                 (cols, rows_vec)
             }
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(e) => {
+                (vec!["ERRO".to_string()], vec![vec![e]])
+            }
         }
     });
 
+    // --- FUNÇÃO DE EXPORTAR CSV ---
     let (headers, all_rows) = report_data.read().clone();
     let total_rows = all_rows.len();
+    
+    let headers_export = headers.clone();
+    let rows_export = all_rows.clone();
+
+    let export_csv = move |_| {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Salvar Relatório CSV")
+            .add_filter("Planilha CSV", &["csv"])
+            .save_file()
+        {
+            match csv::WriterBuilder::new().delimiter(b';').from_path(&path) {
+                Ok(mut wtr) => {
+                    let _ = wtr.write_record(&headers_export);
+                    for row in &rows_export {
+                        let _ = wtr.write_record(row);
+                    }
+                    let _ = wtr.flush();
+                    
+                    error_msg.set(format!("Relatório exportado com sucesso para:\n{}", path.display()));
+                    show_error.set(true);
+                }
+                Err(e) => {
+                    error_msg.set(format!("Erro ao exportar arquivo: {}", e));
+                    show_error.set(true);
+                }
+            }
+        }
+    };
 
     let end_idx = max_visible().min(total_rows);
     let visible_rows = if total_rows > 0 { &all_rows[0..end_idx] } else { &[] };
@@ -88,6 +112,12 @@ pub fn ViewReport(
                         class: "btn-classic",
                         onclick: move |evt| on_back.call(evt),
                         "🏠 Voltar"
+                    }
+                    
+                    button {
+                        class: "btn-classic",
+                        onclick: export_csv,
+                        "💾 Exportar CSV"
                     }
                 }
 
