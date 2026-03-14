@@ -1,4 +1,4 @@
-// #![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
 
 mod core;
@@ -34,11 +34,35 @@ fn main() {
 }
 
 fn App() -> Element {
+    let mut is_loaded = use_signal(|| false);
+
     let mut current_route = use_signal(|| Route::Home);
     let mut selected_report = use_signal(|| String::new());
 
-    let engine_signal = use_signal(|| DataEngine::new());
+    let mut engine_signal = use_signal(|| DataEngine::new_empty());
     let current_sql_signal = use_signal(|| String::new());
+
+    use_future(move || async move {
+        if !is_loaded() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let loaded_engine = tokio::task::spawn_blocking(|| DataEngine::new())
+                .await
+                .unwrap();
+            engine_signal.set(loaded_engine);
+            is_loaded.set(true);
+        }
+    });
+
+    if !is_loaded() {
+        return rsx! {
+            div {
+                style: "display: flex; height: 100vh; width: 100vw; background-color: var(--bg-color, #1e1e1e); color: var(--text-color, #fff); align-items: center; justify-content: center; flex-direction: column; gap: 15px; font-family: sans-serif;",
+                h2 { "Iniciando New Report..." }
+                p { style: "color: gray;", "Carregando estrutura de tabelas..." }
+            }
+        };
+    }
 
     let content: Element = match current_route() {
         Route::Home => rsx! {
