@@ -4,7 +4,7 @@
 mod core;
 mod views;
 mod components {
-    pub mod error_modal;
+    pub mod status_modal;
 }
 use crate::core::engine::DataEngine;
 use dioxus::desktop::{Config, WindowBuilder};
@@ -56,47 +56,46 @@ fn App() -> Element {
 
     if !is_loaded() {
         return rsx! {
-            div {
-                style: "display: flex; height: 100vh; width: 100vw; background-color: var(--bg-color, #1e1e1e); color: var(--text-color, #fff); align-items: center; justify-content: center; flex-direction: column; gap: 15px; font-family: sans-serif;",
+            div { class: "loading-screen",
                 h2 { "Iniciando New Report..." }
-                p { style: "color: gray;", "Carregando estrutura de tabelas..." }
+                p { class: "loading-subtitle", "Carregando estrutura de tabelas..." }
             }
         };
     }
 
     let content: Element = match current_route() {
         Route::Home => rsx! {
-          Home {
-            selected_name: selected_report(),
-            on_select: move |name: String| selected_report.set(name),
-            on_open: move |_| current_route.set(Route::ViewReport),
-            on_edit: move |_| {
-              let current = selected_report.read();
-              if current.contains(".json") || Path::new(&*current).exists() {
-                current_route.set(Route::EditQuery);
-              }
-            },
-            engine: engine_signal,
-            current_sql: current_sql_signal
-          }
+            Home {
+                selected_name: selected_report(),
+                on_select: move |name: String| selected_report.set(name),
+                on_open: move |_| current_route.set(Route::ViewReport),
+                on_edit: move |_| {
+                    let current = selected_report.read();
+                    if current.contains(".json") || Path::new(&*current).exists() {
+                        current_route.set(Route::EditQuery);
+                    }
+                },
+                engine: engine_signal,
+                current_sql: current_sql_signal
+            }
         },
         Route::ViewReport => rsx! {
-          ViewReport {
-            on_back: move |_: MouseEvent| current_route.set(Route::Home),
-            engine: engine_signal,
-            query_sql: current_sql_signal()
-          }
+            ViewReport {
+                on_back: move |_: MouseEvent| current_route.set(Route::Home),
+                engine: engine_signal,
+                query_sql: current_sql_signal()
+            }
         },
         Route::EditQuery => rsx! {
-          EditQuery {
-            report_name: selected_report(),
-            on_back: move |_: MouseEvent| current_route.set(Route::Home)
-          }
+            EditQuery {
+                report_name: selected_report(),
+                on_back: move |_: MouseEvent| current_route.set(Route::Home)
+            }
         },
     };
 
     rsx! {
-      style { {include_str!("style/main.css")} }
-      {content}
+        style { {include_str!("style/main.css")} }
+        {content}
     }
 }

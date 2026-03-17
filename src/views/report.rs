@@ -1,4 +1,4 @@
-use crate::components::error_modal::SqlErrorModal;
+use crate::components::status_modal::{StatusModal, StatusType};
 use crate::core::engine::{DataEngine, append_log};
 use dioxus::prelude::*;
 use rusqlite::types::ValueRef;
@@ -9,8 +9,9 @@ pub fn ViewReport(
     engine: Signal<DataEngine>,
     query_sql: String,
 ) -> Element {
-    let mut show_error = use_signal(|| false);
-    let mut error_msg = use_signal(|| String::new()); 
+    let mut show_status_modal = use_signal(|| false);
+    let mut status_modal_type = use_signal(|| StatusType::Error);
+    let mut status_msg = use_signal(|| String::new());
 
     let mut max_visible = use_signal(|| 1000);
 
@@ -51,20 +52,22 @@ pub fn ViewReport(
                 let rows_vec: Vec<Vec<String>> = rows_iter.filter_map(|r| r.ok()).collect();
                 (cols, rows_vec)
             }
-            Err(e) => {
-                (vec!["ERRO".to_string()], vec![vec![e]])
-            }
+            Err(e) => (vec!["ERRO".to_string()], vec![vec![e]]),
         };
 
         let elapsed_ms = start_time.elapsed().as_millis();
-        append_log("Visualização do Relatório", "Execução da Query SQLite e Renderização", elapsed_ms);
+        append_log(
+            "Visualização do Relatório",
+            "Execução da Query SQLite e Renderização",
+            elapsed_ms,
+        );
 
         res
     });
 
     let (headers, all_rows) = report_data.read().clone();
     let total_rows = all_rows.len();
-    
+
     let headers_export = headers.clone();
     let rows_export = all_rows.clone();
 
@@ -81,20 +84,29 @@ pub fn ViewReport(
                         let _ = wtr.write_record(row);
                     }
                     let _ = wtr.flush();
-                    
-                    error_msg.set(format!("Relatório exportado com sucesso para:\n{}", path.display()));
-                    show_error.set(true);
+
+                    status_msg.set(format!(
+                        "Relatório exportado com sucesso para:\n{}",
+                        path.display()
+                    ));
+                    status_modal_type.set(StatusType::Success);
+                    show_status_modal.set(true);
                 }
                 Err(e) => {
-                    error_msg.set(format!("Erro ao exportar arquivo: {}", e));
-                    show_error.set(true);
+                    status_msg.set(format!("Erro ao exportar arquivo: {}", e));
+                    status_modal_type.set(StatusType::Error);
+                    show_status_modal.set(true);
                 }
             }
         }
     };
 
     let end_idx = max_visible().min(total_rows);
-    let visible_rows = if total_rows > 0 { &all_rows[0..end_idx] } else { &[] };
+    let visible_rows = if total_rows > 0 {
+        &all_rows[0..end_idx]
+    } else {
+        &[]
+    };
     let displayed_count = visible_rows.len();
 
     let status_text = if total_rows == 0 {
@@ -105,11 +117,12 @@ pub fn ViewReport(
 
     rsx! {
         div { class: "app-container",
-            SqlErrorModal {
-                show: show_error,
-                error_message: error_msg(),
-                sql_content: query_sql,
-                on_close: move |_| show_error.set(false)
+            StatusModal {
+                show: show_status_modal,
+                status: status_modal_type(),
+                message: status_msg(),
+                sql_content: query_sql.clone(),
+                on_close: move |_| show_status_modal.set(false)
             }
 
             div { class: "middle-section",
@@ -120,7 +133,7 @@ pub fn ViewReport(
 
                 div { class: "main-view report-view-container",
                     div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados" } }
-                    div { class: "data-container", style: "overflow-y: auto;",
+                    div { class: "data-container",
                         table { class: "pg-table table-wrapper",
                             thead {
                                 tr { {headers.iter().map(|h| rsx! { th { key: "{h}", class: "sticky-header", "{h}" } })} }
@@ -133,10 +146,10 @@ pub fn ViewReport(
                                 })}
                             }
                         }
-                        
+
                         if displayed_count < total_rows {
                             div {
-                                style: "text-align: center; padding: 20px; background: var(--bg-color-light); cursor: pointer; font-weight: bold; border-top: 1px solid var(--border-color);",
+                                class: "load-more-btn",
                                 onclick: move |_| { max_visible += 1000; },
                                 "⬇️ Rolar para carregar mais registros..."
                             }
