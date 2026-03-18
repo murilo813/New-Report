@@ -58,12 +58,17 @@ fn App() -> Element {
         if !is_loaded() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            let loaded_engine = tokio::task::spawn_blocking(|| DataEngine::new())
-                .await
-                .unwrap();
+            let engine_result = tokio::task::spawn_blocking(|| DataEngine::new()).await;
 
-            engine_signal.set(loaded_engine);
-            is_loaded.set(true);
+            match engine_result {
+                Ok(loaded_engine) => {
+                    engine_signal.set(loaded_engine);
+                    is_loaded.set(true);
+                }
+                Err(e) => {
+                    println!("Erro crítico ao subir a Engine: {:?}", e);
+                }
+            }
         }
     });
 
