@@ -1,6 +1,7 @@
 use crate::components::status_modal::{StatusModal, StatusType};
 use crate::core::engine::{DataEngine, append_log};
 use dioxus::prelude::*;
+use rust_xlsxwriter::*;
 
 #[component]
 pub fn ViewReport(
@@ -84,6 +85,38 @@ pub fn ViewReport(
         }
     };
 
+    let export_xlsx = move |_| {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Salvar Relatório Excel")
+            .add_filter("Planilha Excel", &["xlsx"])
+            .save_file() 
+        {
+            let mut workbook = Workbook::new();
+            let worksheet = workbook.add_worksheet();
+
+            let header_format = Format::new().set_bold();
+
+            for (col_idx, header_text) in headers.read().iter().enumerate() {
+                worksheet.write_with_format(0, col_idx as u16, header_text, &header_format).ok();
+            }
+
+            let all_data = engine.read().get_rows_slice(0, total_rows_count());
+
+            for (row_idx, row_data) in all_data.iter().enumerate() {
+                for (col_idx, cell_value) in row_data.iter().enumerate() {
+                    worksheet.write((row_idx + 1) as u32, col_idx as u16, cell_value).ok();
+                }
+            }
+
+            if let Ok(_) = workbook.save(&path) {
+                status_msg.set(format!("Excel exportado com sucesso para:\n{}", path.display()));
+                status_modal_type.set(StatusType::Success);
+                modal_sql_content.set(String::new()); 
+                show_status_modal.set(true);
+            }
+        }
+    };
+
     let status_text = if report_task.read().is_none() {
         "Processando Consulta no Motor DataFusion...".to_string()
     } else {
@@ -104,6 +137,7 @@ pub fn ViewReport(
                 div { class: "sidebar",
                     button { class: "btn-classic", onclick: move |evt| on_back.call(evt), "🏠 Voltar" }
                     button { class: "btn-classic", onclick: export_csv, "💾 Exportar CSV" }
+                    button { class: "btn-classic", onclick: export_xlsx, "📊 Exportar Excel" }
                 }
 
                 div { class: "main-view report-view-container",

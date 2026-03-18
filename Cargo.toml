@@ -24,6 +24,7 @@ dotenvy = "0.15"
 chrono = "=0.4.34"
 datafusion = "37.0"
 rayon = "1.10"
+rust_xlsxwriter = "0.76"
 
 [build-dependencies]
 winres = "0.1"
