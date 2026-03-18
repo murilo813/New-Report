@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use std::sync::Arc;
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct ReportParameter {
     pub id: String,
@@ -160,7 +165,6 @@ fn SqlTab(query_text: Signal<String>) -> Element {
     }
 }
 
-// CONTROLLER
 #[component]
 pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Element {
     let mut active_tab = use_signal(|| EditorTab::Info);
@@ -232,7 +236,6 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
         }
 
         let engine = DataEngine::new();
-        let conn = &engine.sqlite;
         let re_header = regex::Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
         let re_table = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\((.*?)\)").unwrap();
 
@@ -259,22 +262,23 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                 .find(|(k, _)| k.to_lowercase() == table_name)
             {
                 Some((_, config)) => {
-                    let col_defs: Vec<String> = config
-                        .columns
-                        .iter()
-                        .map(|col| {
-                            let dtype = match col.field_type.as_str() {
-                                "I" => "INTEGER",
-                                "F" => "REAL",
-                                _ => "TEXT",
-                            };
-                            format!("\"{}\" {}", col.name, dtype)
-                        })
-                        .collect();
-                    let _ = conn.execute(
-                        &format!("CREATE TABLE {} ({})", table_name, col_defs.join(", ")),
-                        [],
-                    );
+                    let mut arrow_fields = Vec::new();
+                    for col in &config.columns {
+                        let dtype = match col.field_type.as_str() {
+                            "I" => DataType::Int64,
+                            "F" => DataType::Float64,
+                            "D" => DataType::Date32,
+                            _ => DataType::Utf8,
+                        };
+                        arrow_fields.push(Field::new(&col.name.to_lowercase(), dtype, true));
+                    }
+                    let schema = Arc::new(ArrowSchema::new(arrow_fields));
+                    let empty_batch = RecordBatch::new_empty(schema.clone());
+                    let mem_table = MemTable::try_new(schema, vec![vec![empty_batch]]).unwrap();
+                    engine
+                        .ctx
+                        .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
+                        .unwrap();
                 }
                 None => {
                     status_msg.set(format!(
@@ -288,35 +292,29 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
             }
         }
 
-        let mut clean_sql = re_header.replace_all(&sql, "").to_string();
+        let clean_sql_str = re_header.replace_all(&sql, "").to_string();
         let re_vars = regex::Regex::new(r"\[([a-zA-Z0-9_]+)\]").unwrap();
+        let mut final_sql = clean_sql_str;
 
-        for cap in re_vars.captures_iter(&clean_sql.clone()) {
+        for cap in re_vars.captures_iter(&final_sql.clone()) {
             let var_id = cap[1].to_string();
             if let Some(param) = parameters.read().iter().find(|p| p.id == var_id) {
                 if param.valor_padrao.trim().is_empty() {
-                    status_msg.set(format!("Erro de Validação: A variável '[{}]' está no SQL, mas o 'Valor Padrão' dela está vazio na aba de Parâmetros.", var_id));
+                    status_msg.set(format!("Erro de Validação: A variável '[{}]' está no SQL, mas o 'Valor Padrão' dela está vazio.", var_id));
                     status_modal_type.set(StatusType::Error);
                     show_status_modal.set(true);
                     return;
                 }
-                clean_sql = clean_sql.replace(&format!("[{}]", var_id), &param.valor_padrao);
-            } else {
-                status_msg.set(format!(
-                    "Variável '[{}]' foi escrita no SQL, mas não foi criada na aba de Parâmetros!",
-                    var_id
-                ));
-                status_modal_type.set(StatusType::Error);
-                show_status_modal.set(true);
-                return;
+                final_sql = final_sql.replace(&format!("[{}]", var_id), &param.valor_padrao);
             }
         }
 
-        let commands: Vec<&str> = clean_sql
+        let commands: Vec<String> = final_sql
             .split(';')
-            .map(|s| s.trim())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
         if commands.is_empty() {
             status_msg.set("O SQL está vazio após a tag de sincronização.".to_string());
             status_modal_type.set(StatusType::Error);
@@ -324,18 +322,55 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
             return;
         }
 
-        for cmd in commands {
-            if let Err(e) = conn.prepare(cmd) {
-                status_msg.set(format!("Erro de Sintaxe no SQL:\n{}", e));
+        let test_result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for cmd in commands {
+                    if let Err(e) = engine.ctx.sql(&cmd).await {
+                        return Err(e.to_string());
+                    }
+                }
+                Ok(())
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Err("Erro crítico ao inicializar ambiente de teste SQL.".to_string()));
+
+        match test_result {
+            Ok(_) => {
+                status_msg.set("SQL Validado com Sucesso!\n\nA sintaxe e as colunas foram aprovadas pelo DataFusion.".to_string());
+                status_modal_type.set(StatusType::Success);
+                show_status_modal.set(true);
+            }
+            Err(e) => {
+                let mut clean_error = e.clone();
+
+                if let Some(idx) = clean_error.find("Valid fields are") {
+                    clean_error = clean_error[..idx].to_string();
+                }
+                if let Some(idx) = clean_error.find("Did you mean") {
+                    clean_error = clean_error[..idx].to_string();
+                }
+
+                let clean_error = clean_error.trim().to_string();
+
+                let final_msg = if clean_error.is_empty() {
+                    "Erro de sintaxe SQL ou coluna não encontrada.\n(Verifique o uso de maiúsculas e minúsculas)".to_string()
+                } else {
+                    format!(
+                        "{}\n\n(Dica: O DataFusion é sensível a maiúsculas/minúsculas. Se o schema.toml está minúsculo, use minúsculo no SQL ou coloque aspas duplas, ex: \"ID\")",
+                        clean_error
+                    )
+                };
+
+                status_msg.set(final_msg);
                 status_modal_type.set(StatusType::Error);
                 show_status_modal.set(true);
-                return;
             }
         }
-
-        status_msg.set("SQL Validado com Sucesso!\n\nAs variáveis foram identificadas e o valor padrão passou no teste.".to_string());
-        status_modal_type.set(StatusType::Success);
-        show_status_modal.set(true);
     };
 
     let report_name_original = report_name.clone();

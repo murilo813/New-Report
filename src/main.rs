@@ -26,7 +26,7 @@ fn main() {
 
     let config = Config::new().with_window(
         WindowBuilder::new()
-            .with_title("NewREPORT - Agro Zecão")
+            .with_title("NewREPORT - Agro Zecão | Powered by DataFusion")
             .with_maximized(true),
     );
 
@@ -35,7 +35,6 @@ fn main() {
 
 fn App() -> Element {
     let mut is_loaded = use_signal(|| false);
-
     let mut current_route = use_signal(|| Route::Home);
     let mut selected_report = use_signal(|| String::new());
 
@@ -49,6 +48,7 @@ fn App() -> Element {
             let loaded_engine = tokio::task::spawn_blocking(|| DataEngine::new())
                 .await
                 .unwrap();
+
             engine_signal.set(loaded_engine);
             is_loaded.set(true);
         }
@@ -57,8 +57,9 @@ fn App() -> Element {
     if !is_loaded() {
         return rsx! {
             div { class: "loading-screen",
-                h2 { "Iniciando New Report..." }
-                p { class: "loading-subtitle", "Carregando estrutura de tabelas..." }
+                div { class: "spinner" }
+                h2 { "Iniciando Engine de Alta Performance..." }
+                p { class: "loading-subtitle", "Subindo motor analítico DataFusion..." }
             }
         };
     }

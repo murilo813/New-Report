@@ -274,25 +274,9 @@ fn ParamsModal(
                                                             std::thread::spawn(move || {
                                                                 let mut tmp_engine = DataEngine::new();
                                                                 let cancel = Arc::new(AtomicBool::new(false));
-                                                                if let Ok(_) = tmp_engine.process_report_with_progress(&sql_for_spawn, cancel, |_| {}) {
-                                                                    if let Ok(mut stmt) = tmp_engine.execute_user_sql(&sql_for_spawn) {
-                                                                        let cols: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_string()).collect();
-                                                                        let col_count = stmt.column_count();
-                                                                        let rows_iter = stmt.query_map([], |row| {
-                                                                            let mut r = Vec::with_capacity(col_count);
-                                                                            for i in 0..col_count {
-                                                                                let val = row.get_ref(i).unwrap();
-                                                                                r.push(match val {
-                                                                                    rusqlite::types::ValueRef::Null => "".to_string(),
-                                                                                    rusqlite::types::ValueRef::Integer(v) => v.to_string(),
-                                                                                    rusqlite::types::ValueRef::Real(v) => format!("{:.2}", v),
-                                                                                    rusqlite::types::ValueRef::Text(v) => String::from_utf8_lossy(v).to_string(),
-                                                                                    _ => "[BIN]".to_string(),
-                                                                                });
-                                                                            }
-                                                                            Ok(r)
-                                                                        }).unwrap();
-                                                                        let rows: Vec<Vec<String>> = rows_iter.filter_map(|r| r.ok()).collect();
+
+                                                                if let Ok(_) = tmp_engine.process_report_with_progress(&sql_for_spawn, cancel, "Pesquisa Lookup", |_| {}) {
+                                                                    if let Ok((cols, rows)) = tmp_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
                                                                         let _ = tx.send(Ok((cols, rows)));
                                                                         return;
                                                                     }
@@ -462,15 +446,17 @@ pub fn Home(
             let result = new_engine.process_report_with_progress(
                 &sql_to_process,
                 current_cancel,
+                &report_name_log,
                 move |p| {
                     let _ = tx_progress.send(LoaderMsg::Progress(p));
                 },
             );
+
             let elapsed_ms = start_time.elapsed().as_millis();
             if result.is_ok() {
                 append_log(
                     &report_name_log,
-                    "Processamento DBISAM -> RAM SQLite",
+                    "Processamento DBISAM -> Memória DataFusion",
                     elapsed_ms,
                 );
             }

@@ -1,9 +1,7 @@
-use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use encoding_rs::WINDOWS_1252;
 use memmap2::Mmap;
 use regex::Regex;
-use rusqlite::{Connection as SqliteConn, types::Value};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -14,14 +12,21 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::{Duration, SystemTime};
+
+use datafusion::arrow::array::{
+    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::*;
 
 const DBISAM_HEADER_MIN_LEN: usize = 512;
 const DBISAM_OFFSET_TOTAL_ROWS: std::ops::Range<usize> = 0x29..0x2D;
 const DBISAM_OFFSET_TOTAL_FIELDS: std::ops::Range<usize> = 0x2F..0x31;
 const DBISAM_BASE_HEADER_SIZE: usize = 0x200; // 512 bytes
 const DBISAM_FIELD_DEF_SIZE: usize = 768;
-const CHUNK_SIZE: usize = 10_000;
+const CHUNK_SIZE: usize = 50_000;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Column {
@@ -38,24 +43,32 @@ pub struct TableConfig {
 }
 
 pub struct DataEngine {
-    pub sqlite: SqliteConn,
+    pub ctx: SessionContext,
     pub schema: BTreeMap<String, TableConfig>,
     pub base_path: String,
 }
 
 enum WorkerMsg {
-    Chunk {
+    Batch {
         table_name: String,
-        rows: Vec<Vec<Value>>,
+        batch: RecordBatch,
         processed_count: usize,
     },
     Error(String),
 }
 
+enum ColBuilder {
+    Int(Int64Builder),
+    Float(Float64Builder),
+    Date(Date32Builder),
+    Text(StringBuilder),
+    Bool(BooleanBuilder),
+}
+
 impl DataEngine {
     pub fn new_empty() -> Self {
         Self {
-            sqlite: SqliteConn::open_in_memory().expect("Falha ao abrir SQLite em memória"),
+            ctx: SessionContext::new(),
             schema: BTreeMap::new(),
             base_path: String::new(),
         }
@@ -69,7 +82,6 @@ impl DataEngine {
         }
         dotenv().ok();
 
-        let conn = SqliteConn::open_in_memory().expect("Falha ao abrir SQLite em memória");
         let base_path = env::var("DB_PATH")
             .map(|v| v.replace('"', ""))
             .unwrap_or_else(|_| r"C:\BmSoft\Bases\zecao".to_string());
@@ -91,7 +103,7 @@ impl DataEngine {
         }
 
         Self {
-            sqlite: conn,
+            ctx: SessionContext::new(),
             schema,
             base_path,
         }
@@ -129,11 +141,17 @@ impl DataEngine {
         &mut self,
         user_sql: &str,
         cancel_flag: Arc<AtomicBool>,
+        report_name: &str,
         mut on_progress: F,
     ) -> Result<(), String>
     where
         F: FnMut(f32) + Send + 'static,
     {
+        self.ctx = SessionContext::new();
+
+        let start_carga = std::time::Instant::now();
+        let mut tempo_registro = 0;
+
         let sync_tasks = self.parse_sync_header(user_sql);
         if sync_tasks.is_empty() {
             return Err("Tag [SYNC: ...] não encontrada ou formato inválido!".to_string());
@@ -141,9 +159,6 @@ impl DataEngine {
         if self.schema.is_empty() {
             return Err("schema.toml não encontrado ou vazio!".to_string());
         }
-
-        let _ = self.sqlite.execute("PRAGMA synchronous = OFF", []);
-        let _ = self.sqlite.execute("PRAGMA journal_mode = MEMORY", []);
 
         let mut total_rows_overall = 0;
         for (table_name, _) in &sync_tasks {
@@ -165,7 +180,7 @@ impl DataEngine {
         }
         let total_rows_f32 = total_rows_overall as f32;
 
-        let mut insert_sqls = HashMap::new();
+        let mut extract_jobs = HashMap::new();
 
         for (table_name, requested_cols) in &sync_tasks {
             let config = self
@@ -191,35 +206,13 @@ impl DataEngine {
                         .collect()
                 };
 
-            let col_defs: Vec<String> = target_columns
-                .iter()
-                .map(|col| {
-                    let dtype = match col.field_type.as_str() {
-                        "I" => "INTEGER",
-                        "F" => "REAL",
-                        _ => "TEXT",
-                    };
-                    format!("\"{}\" {}", col.name, dtype)
-                })
-                .collect();
-
-            let _ = self
-                .sqlite
-                .execute(&format!("DROP TABLE IF EXISTS {}", table_name), []);
-            let create_sql = format!("CREATE TABLE {} ({})", table_name, col_defs.join(", "));
-            self.sqlite
-                .execute(&create_sql, [])
-                .map_err(|e| e.to_string())?;
-
-            let placeholders = vec!["?"; target_columns.len()].join(", ");
-            let insert_sql = format!("INSERT INTO {} VALUES ({})", table_name, placeholders);
-            insert_sqls.insert(table_name.clone(), (insert_sql, config, target_columns));
+            extract_jobs.insert(table_name.clone(), (config, target_columns));
         }
 
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
 
-        for (table_name, (_, config, target_columns)) in insert_sqls.clone() {
+        for (table_name, (config, target_columns)) in extract_jobs.clone() {
             let tx_clone = tx.clone();
             let cancel = cancel_flag.clone();
             let base_path_clone = self.base_path.clone();
@@ -239,9 +232,9 @@ impl DataEngine {
         }
         drop(tx);
 
-        let db_tx = self.sqlite.transaction().map_err(|e| e.to_string())?;
         let mut total_processed = 0;
         let mut final_error = None;
+        let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
 
         for msg in rx {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -249,19 +242,19 @@ impl DataEngine {
             }
 
             match msg {
-                WorkerMsg::Chunk {
+                WorkerMsg::Batch {
                     table_name,
-                    rows,
+                    batch,
                     processed_count,
                 } => {
-                    let (sql, _, _) = insert_sqls
-                        .get(&table_name)
-                        .ok_or("Erro interno no cache SQL".to_string())?;
-                    let mut stmt = db_tx.prepare_cached(sql).map_err(|e| e.to_string())?;
-                    for row in rows {
-                        stmt.execute(rusqlite::params_from_iter(row))
-                            .map_err(|e| e.to_string())?;
-                    }
+                    let start_registro = std::time::Instant::now();
+
+                    table_batches
+                        .entry(table_name)
+                        .or_insert_with(Vec::new)
+                        .push(batch);
+
+                    tempo_registro += start_registro.elapsed().as_millis();
 
                     total_processed += processed_count;
                     let progress_percent = (total_processed as f32 / total_rows_f32) * 100.0;
@@ -279,39 +272,128 @@ impl DataEngine {
             return Err(err);
         }
 
-        db_tx.commit().map_err(|e| e.to_string())?;
         for h in handles {
             let _ = h.join();
         }
 
+        for (table_name, batches) in table_batches {
+            if !batches.is_empty() {
+                let schema = batches[0].schema();
+                let mem_table = MemTable::try_new(schema, vec![batches])
+                    .map_err(|e| format!("Erro ao mapear MemTable: {}", e))?;
+
+                self.ctx
+                    .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
+                    .map_err(|e| format!("Erro ao registrar tabela {}: {}", table_name, e))?;
+            }
+        }
+
+        let tempo_total = start_carga.elapsed().as_millis();
+        let tempo_extracao = tempo_total.saturating_sub(tempo_registro);
+
+        println!("⏱️ [EXTRAÇÃO DBISAM -> ARROW] {} ms", tempo_extracao);
+        println!("⏱️ [REGISTRO DATAFUSION] {} ms", tempo_registro);
+
+        append_log(
+            report_name,
+            "1. Extração DBISAM (.dat -> Arrow)",
+            tempo_extracao,
+        );
+        append_log(
+            report_name,
+            "2. Registro DataFusion (Memória Colunar)",
+            tempo_registro,
+        );
+
         Ok(())
     }
 
-    pub fn execute_user_sql(&self, sql: &str) -> Result<rusqlite::Statement<'_>, String> {
+    pub fn execute_user_sql(
+        &self,
+        sql: &str,
+        report_name: &str,
+    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+        let start_sql = std::time::Instant::now();
+
         let re_sync = Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").map_err(|e| e.to_string())?;
         let clean_sql = re_sync.replace_all(sql, "").to_string();
 
-        let commands: Vec<&str> = clean_sql
+        let commands: Vec<String> = clean_sql
             .split(';')
-            .map(|s| s.trim())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
         if commands.is_empty() {
             return Err("SQL vazio".to_string());
         }
 
-        for i in 0..(commands.len() - 1) {
-            let cmd = commands[i];
-            self.sqlite
-                .execute(cmd, [])
-                .map_err(|e| format!("Erro no comando {}: {}", cmd, e))?;
-            let _ = self.sqlite.execute("PRAGMA schema_version", []);
-        }
+        let ctx = self.ctx.clone();
 
-        let last_query = commands.last().unwrap_or(&"");
-        self.sqlite
-            .prepare(last_query)
-            .map_err(|e| format!("Erro no SELECT final: {}", e))
+        let result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                for i in 0..(commands.len() - 1) {
+                    let cmd = &commands[i];
+                    ctx.sql(cmd)
+                        .await
+                        .map_err(|e| format!("Erro no comando {}: {}", cmd, e))?;
+                }
+
+                let last_query = commands.last().unwrap();
+                let df = ctx
+                    .sql(last_query)
+                    .await
+                    .map_err(|e| format!("Erro no SELECT final: {}", e))?;
+
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Erro ao coletar dados: {}", e))?;
+
+                let mut cols = Vec::new();
+                let mut rows_vec = Vec::new();
+
+                if !batches.is_empty() {
+                    let schema = batches[0].schema();
+                    cols = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+                    for batch in batches {
+                        let num_rows = batch.num_rows();
+                        let num_cols = batch.num_columns();
+
+                        for row_idx in 0..num_rows {
+                            let mut row_data = Vec::with_capacity(num_cols);
+                            for col_idx in 0..num_cols {
+                                let array = batch.column(col_idx);
+                                let val_str =
+                                    datafusion::arrow::util::display::array_value_to_string(
+                                        array, row_idx,
+                                    )
+                                    .unwrap_or_default();
+                                row_data.push(val_str);
+                            }
+                            rows_vec.push(row_data);
+                        }
+                    }
+                }
+                Ok((cols, rows_vec))
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            Err("Panic: Erro crítico na thread do DataFusion ao tentar renderizar.".to_string())
+        });
+
+        let tempo_sql = start_sql.elapsed().as_millis();
+        println!("⏱️ [EXECUÇÃO DATAFUSION] {} ms", tempo_sql);
+        append_log(report_name, "3. Execução Vetorizada DataFusion", tempo_sql);
+
+        result
     }
 }
 
@@ -345,8 +427,41 @@ fn parse_dbisam_table(
         .map(u32::from_le_bytes)
         .unwrap_or(0);
 
-    let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+    let mut arrow_fields = Vec::new();
+    let mut builders: Vec<ColBuilder> = Vec::new();
+
+    for col in &target_columns {
+        let normalized_name = col.name.to_lowercase();
+
+        match col.field_type.as_str() {
+            "I" => {
+                if col.length == 1 {
+                    arrow_fields.push(Field::new(&normalized_name, DataType::Boolean, true));
+                    builders.push(ColBuilder::Bool(BooleanBuilder::new()));
+                } else {
+                    arrow_fields.push(Field::new(&normalized_name, DataType::Int64, true));
+                    builders.push(ColBuilder::Int(Int64Builder::new()));
+                }
+            }
+            "F" => {
+                arrow_fields.push(Field::new(&normalized_name, DataType::Float64, true));
+                builders.push(ColBuilder::Float(Float64Builder::new()));
+            }
+            "D" => {
+                arrow_fields.push(Field::new(&normalized_name, DataType::Date32, true));
+                builders.push(ColBuilder::Date(Date32Builder::new()));
+            }
+            _ => {
+                arrow_fields.push(Field::new(&normalized_name, DataType::Utf8, true));
+                builders.push(ColBuilder::Text(StringBuilder::new()));
+            }
+        }
+    }
+
+    let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
+
     let mut count = 0;
+    let mut chunk_count = 0;
     let mut i = data_offset;
 
     while i + config.record_size as usize <= mmap.len() && count < total_rows_expected {
@@ -356,31 +471,39 @@ fn parse_dbisam_table(
 
         if let Some(row_data) = mmap.get(i..i + config.record_size as usize) {
             if row_data[0] == 0 {
-                let mut row_vals = Vec::with_capacity(target_columns.len());
-                for col in &target_columns {
+                for (col_idx, col) in target_columns.iter().enumerate() {
                     let start = col.offset as usize + 1;
                     let end = start + col.length as usize;
 
-                    let val = match col.field_type.as_str() {
-                        "I" => {
-                            let v = i32::from_le_bytes(
-                                row_data
-                                    .get(start..start + 4)
-                                    .and_then(|s| s.try_into().ok())
-                                    .unwrap_or([0; 4]),
-                            );
-                            Value::Integer(v as i64)
+                    match &mut builders[col_idx] {
+                        ColBuilder::Int(b) => {
+                            let val = match col.length {
+                                1 => row_data[start] as i64,
+                                2 => i16::from_le_bytes(
+                                    row_data
+                                        .get(start..start + 2)
+                                        .and_then(|s| s.try_into().ok())
+                                        .unwrap_or([0; 2]),
+                                ) as i64,
+                                _ => i32::from_le_bytes(
+                                    row_data
+                                        .get(start..start + 4)
+                                        .and_then(|s| s.try_into().ok())
+                                        .unwrap_or([0; 4]),
+                                ) as i64,
+                            };
+                            b.append_value(val);
                         }
-                        "F" => {
+                        ColBuilder::Float(b) => {
                             let v = f64::from_le_bytes(
                                 row_data
                                     .get(start..start + 8)
                                     .and_then(|s| s.try_into().ok())
                                     .unwrap_or([0; 8]),
                             );
-                            Value::Real(v)
+                            b.append_value(v);
                         }
-                        "D" => {
+                        ColBuilder::Date(b) => {
                             let days = i32::from_le_bytes(
                                 row_data
                                     .get(start..start + 4)
@@ -388,64 +511,71 @@ fn parse_dbisam_table(
                                     .unwrap_or([0; 4]),
                             );
                             if days > 0 {
-                                Value::Text(convert_dbisam_to_iso(days))
+                                b.append_value(days - 719163);
                             } else {
-                                Value::Null
+                                b.append_null();
                             }
                         }
-                        _ => {
+                        ColBuilder::Text(b) => {
                             if let Some(slice) = row_data.get(start..end) {
-                                Value::Text(DataEngine::decode_db_string(slice))
+                                b.append_value(DataEngine::decode_db_string(slice));
                             } else {
-                                Value::Null
+                                b.append_null();
                             }
                         }
-                    };
-                    row_vals.push(val);
+                        ColBuilder::Bool(b) => {
+                            let v = row_data[start];
+                            b.append_value(v != 0);
+                        }
+                    }
                 }
-                chunk.push(row_vals);
                 count += 1;
+                chunk_count += 1;
             }
         }
         i += config.record_size as usize;
 
-        if chunk.len() >= CHUNK_SIZE {
-            let mut to_send = Vec::with_capacity(CHUNK_SIZE);
-            std::mem::swap(&mut chunk, &mut to_send);
-            if tx
-                .send(WorkerMsg::Chunk {
-                    table_name: table_name.clone(),
-                    rows: to_send,
-                    processed_count: CHUNK_SIZE,
-                })
-                .is_err()
-            {
-                return Err("Main thread fechou o canal".to_string());
-            }
+        if chunk_count >= CHUNK_SIZE {
+            send_batch(&table_name, &arrow_schema, &mut builders, chunk_count, &tx)?;
+            chunk_count = 0;
         }
     }
 
-    if !chunk.is_empty() {
-        let len = chunk.len();
-        let _ = tx.send(WorkerMsg::Chunk {
-            table_name,
-            rows: chunk,
-            processed_count: len,
-        });
+    if chunk_count > 0 {
+        send_batch(&table_name, &arrow_schema, &mut builders, chunk_count, &tx)?;
     }
 
     Ok(())
 }
 
-fn convert_dbisam_to_iso(days: i32) -> String {
-    let epoch_days = days - 719163;
-    let seconds = (epoch_days as i64) * 86400;
-    if let Some(t) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds.max(0) as u64))
-    {
-        let datetime: DateTime<Utc> = t.into();
-        return datetime.format("%Y-%m-%d").to_string();
-    }
-    "0001-01-01".to_string()
+fn send_batch(
+    table_name: &str,
+    schema: &Arc<ArrowSchema>,
+    builders: &mut Vec<ColBuilder>,
+    count: usize,
+    tx: &mpsc::Sender<WorkerMsg>,
+) -> Result<(), String> {
+    let arrays: Vec<ArrayRef> = builders
+        .iter_mut()
+        .map(|b| match b {
+            ColBuilder::Int(b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Float(b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Date(b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Text(b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Bool(b) => Arc::new(b.finish()) as ArrayRef,
+        })
+        .collect();
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
+
+    tx.send(WorkerMsg::Batch {
+        table_name: table_name.to_string(),
+        batch,
+        processed_count: count,
+    })
+    .map_err(|_| "Falha ao enviar o batch Arrow".to_string())?;
+
+    Ok(())
 }
 
 pub fn append_log(report_name: &str, stage: &str, duration_ms: u128) {

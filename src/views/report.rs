@@ -1,7 +1,6 @@
 use crate::components::status_modal::{StatusModal, StatusType};
 use crate::core::engine::{DataEngine, append_log};
 use dioxus::prelude::*;
-use rusqlite::types::ValueRef;
 
 #[component]
 pub fn ViewReport(
@@ -17,55 +16,36 @@ pub fn ViewReport(
 
     let sql_to_query = query_sql.clone();
 
-    let report_data = use_signal(move || {
-        let engine_handle = engine.read();
+    let report_data = use_resource(move || {
+        let current_engine = engine.clone();
+        let sql = sql_to_query.clone();
 
-        let start_time = std::time::Instant::now();
+        async move {
+            let start_time = std::time::Instant::now();
 
-        let res = match engine_handle.execute_user_sql(&sql_to_query) {
-            Ok(mut stmt) => {
-                let cols: Vec<String> = stmt
-                    .column_names()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect();
+            let engine_handle = current_engine.read();
 
-                let col_count = stmt.column_count();
+            let res = match engine_handle.execute_user_sql(&sql, "Tela de Visualização") {
+                Ok((cols, rows_vec)) => (cols, rows_vec),
+                Err(e) => (vec!["ERRO".to_string()], vec![vec![e]]),
+            };
 
-                let rows_iter = stmt
-                    .query_map([], |row| {
-                        let mut row_data = Vec::with_capacity(col_count);
-                        for i in 0..col_count {
-                            let val = row.get_ref(i).unwrap();
-                            row_data.push(match val {
-                                ValueRef::Null => "".to_string(),
-                                ValueRef::Integer(i) => i.to_string(),
-                                ValueRef::Real(f) => format!("{:.2}", f),
-                                ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                                _ => "[BIN]".to_string(),
-                            });
-                        }
-                        Ok(row_data)
-                    })
-                    .expect("Erro ao mapear linhas do SQLite");
+            let elapsed_ms = start_time.elapsed().as_millis();
+            append_log(
+                "Visualização do Relatório",
+                "Execução da Query DATAFUSION e Renderização",
+                elapsed_ms,
+            );
 
-                let rows_vec: Vec<Vec<String>> = rows_iter.filter_map(|r| r.ok()).collect();
-                (cols, rows_vec)
-            }
-            Err(e) => (vec!["ERRO".to_string()], vec![vec![e]]),
-        };
-
-        let elapsed_ms = start_time.elapsed().as_millis();
-        append_log(
-            "Visualização do Relatório",
-            "Execução da Query SQLite e Renderização",
-            elapsed_ms,
-        );
-
-        res
+            res
+        }
     });
 
-    let (headers, all_rows) = report_data.read().clone();
+    let (headers, all_rows) = match &*report_data.read() {
+        Some((h, r)) => (h.clone(), r.clone()),
+        None => (vec!["Processando...".to_string()], vec![]),
+    };
+
     let total_rows = all_rows.len();
 
     let headers_export = headers.clone();
@@ -77,26 +57,26 @@ pub fn ViewReport(
             .add_filter("Planilha CSV", &["csv"])
             .save_file()
         {
-            match csv::WriterBuilder::new().delimiter(b';').from_path(&path) {
-                Ok(mut wtr) => {
-                    let _ = wtr.write_record(&headers_export);
-                    for row in &rows_export {
-                        let _ = wtr.write_record(row);
-                    }
-                    let _ = wtr.flush();
+            let mut file_content = String::new();
+            file_content.push_str(&headers_export.join(";"));
+            file_content.push('\n');
 
-                    status_msg.set(format!(
-                        "Relatório exportado com sucesso para:\n{}",
-                        path.display()
-                    ));
-                    status_modal_type.set(StatusType::Success);
-                    show_status_modal.set(true);
-                }
-                Err(e) => {
-                    status_msg.set(format!("Erro ao exportar arquivo: {}", e));
-                    status_modal_type.set(StatusType::Error);
-                    show_status_modal.set(true);
-                }
+            for row in &rows_export {
+                file_content.push_str(&row.join(";"));
+                file_content.push('\n');
+            }
+
+            if let Ok(_) = std::fs::write(&path, file_content) {
+                status_msg.set(format!(
+                    "Relatório exportado com sucesso para:\n{}",
+                    path.display()
+                ));
+                status_modal_type.set(StatusType::Success);
+                show_status_modal.set(true);
+            } else {
+                status_msg.set("Erro ao escrever arquivo CSV.".to_string());
+                status_modal_type.set(StatusType::Error);
+                show_status_modal.set(true);
             }
         }
     };
@@ -109,8 +89,10 @@ pub fn ViewReport(
     };
     let displayed_count = visible_rows.len();
 
-    let status_text = if total_rows == 0 {
-        "Nenhum registro encontrado".to_string()
+    let status_text = if report_data.read().is_none() {
+        "Processando Consulta SQL no Motor DataFusion...".to_string()
+    } else if total_rows == 0 {
+        "Consulta concluída: Nenhum registro encontrado para os filtros selecionados.".to_string()
     } else {
         format!("Exibindo {} de {} registros", displayed_count, total_rows)
     };
@@ -127,30 +109,59 @@ pub fn ViewReport(
 
             div { class: "middle-section",
                 div { class: "sidebar",
-                    button { class: "btn-classic", onclick: move |evt| on_back.call(evt), "🏠 Voltar" }
-                    button { class: "btn-classic", onclick: export_csv, "💾 Exportar CSV" }
+                    button {
+                        class: "btn-classic",
+                        onclick: move |evt| on_back.call(evt),
+                        "🏠 Voltar"
+                    }
+                    button {
+                        class: "btn-classic",
+                        onclick: export_csv,
+                        "💾 Exportar CSV"
+                    }
                 }
 
                 div { class: "main-view report-view-container",
-                    div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados" } }
+                    div { class: "top-toolbar",
+                        span { class: "folder-name", "Visualização de Dados" }
+                    }
                     div { class: "data-container",
-                        table { class: "pg-table table-wrapper",
-                            thead {
-                                tr { {headers.iter().map(|h| rsx! { th { key: "{h}", class: "sticky-header", "{h}" } })} }
-                            }
-                            tbody {
-                                {visible_rows.iter().enumerate().map(|(i, row)| rsx! {
-                                    tr { key: "{i}",
-                                        {row.iter().enumerate().map(|(j, cell)| rsx! { td { key: "{j}", "{cell}" } })}
+                        if report_data.read().is_none() {
+                            div { class: "empty-msg", "Analisando dados, por favor aguarde..." }
+                        } else if total_rows == 0 {
+                             div { class: "empty-msg", "Sem resultados. Revise os parâmetros da consulta." }
+                        } else {
+                            table { class: "pg-table table-wrapper",
+                                thead {
+                                    tr {
+                                        for h in headers.iter() {
+                                            th {
+                                                key: "{h}",
+                                                class: "sticky-header",
+                                                "{h}"
+                                            }
+                                        }
                                     }
-                                })}
+                                }
+                                tbody {
+                                    for (i, row) in visible_rows.iter().enumerate() {
+                                        tr {
+                                            key: "{i}",
+                                            for (j, cell) in row.iter().enumerate() {
+                                                td { key: "{j}", "{cell}" }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 
-                        if displayed_count < total_rows {
+                        if displayed_count > 0 && displayed_count < total_rows {
                             div {
                                 class: "load-more-btn",
-                                onclick: move |_| { max_visible += 1000; },
+                                onclick: move |_| {
+                                    max_visible.set(max_visible() + 1000);
+                                },
                                 "⬇️ Rolar para carregar mais registros..."
                             }
                         }
