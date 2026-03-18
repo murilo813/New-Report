@@ -1,6 +1,14 @@
+use datafusion::arrow::array::{
+    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::*;
 use dotenvy::dotenv;
 use encoding_rs::WINDOWS_1252;
 use memmap2::Mmap;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -12,14 +20,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-
-use datafusion::arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
-use datafusion::prelude::*;
 
 const DBISAM_HEADER_MIN_LEN: usize = 512;
 const DBISAM_OFFSET_TOTAL_ROWS: std::ops::Range<usize> = 0x29..0x2D;
@@ -460,92 +460,105 @@ fn parse_dbisam_table(
 
     let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
 
-    let mut count = 0;
-    let mut chunk_count = 0;
-    let mut i = data_offset;
+    let row_indexes: Vec<u32> = (0..total_rows_expected).collect();
 
-    while i + config.record_size as usize <= mmap.len() && count < total_rows_expected {
+    row_indexes.par_chunks(CHUNK_SIZE).try_for_each(|chunk| {
         if cancel.load(Ordering::SeqCst) {
             return Err("Operação cancelada pelo usuário".to_string());
         }
 
-        if let Some(row_data) = mmap.get(i..i + config.record_size as usize) {
-            if row_data[0] == 0 {
-                for (col_idx, col) in target_columns.iter().enumerate() {
-                    let start = col.offset as usize + 1;
-                    let end = start + col.length as usize;
+        let mut local_builders = create_builders_from_cols(&target_columns);
+        let mut local_count = 0;
 
-                    match &mut builders[col_idx] {
-                        ColBuilder::Int(b) => {
-                            let val = match col.length {
-                                1 => row_data[start] as i64,
-                                2 => i16::from_le_bytes(
-                                    row_data
-                                        .get(start..start + 2)
-                                        .and_then(|s| s.try_into().ok())
-                                        .unwrap_or([0; 2]),
-                                ) as i64,
-                                _ => i32::from_le_bytes(
-                                    row_data
-                                        .get(start..start + 4)
-                                        .and_then(|s| s.try_into().ok())
-                                        .unwrap_or([0; 4]),
-                                ) as i64,
-                            };
-                            b.append_value(val);
-                        }
-                        ColBuilder::Float(b) => {
-                            let v = f64::from_le_bytes(
-                                row_data
-                                    .get(start..start + 8)
-                                    .and_then(|s| s.try_into().ok())
-                                    .unwrap_or([0; 8]),
-                            );
-                            b.append_value(v);
-                        }
-                        ColBuilder::Date(b) => {
-                            let days = i32::from_le_bytes(
-                                row_data
-                                    .get(start..start + 4)
-                                    .and_then(|s| s.try_into().ok())
-                                    .unwrap_or([0; 4]),
-                            );
-                            if days > 0 {
-                                b.append_value(days - 719163);
-                            } else {
-                                b.append_null();
+        for &row_idx in chunk {
+            let offset_da_linha = data_offset + (row_idx as usize * config.record_size as usize);
+
+            if let Some(row_data) =
+                mmap.get(offset_da_linha..offset_da_linha + config.record_size as usize)
+            {
+                if row_data[0] == 0 {
+                    for (col_idx, col) in target_columns.iter().enumerate() {
+                        let start = col.offset as usize + 1;
+                        let end = start + col.length as usize;
+
+                        match &mut local_builders[col_idx] {
+                            ColBuilder::Int(b) => {
+                                let val = match col.length {
+                                    1 => row_data[start] as i64,
+                                    2 => i16::from_le_bytes(
+                                        row_data[start..start + 2].try_into().unwrap_or([0; 2]),
+                                    ) as i64,
+                                    _ => i32::from_le_bytes(
+                                        row_data[start..start + 4].try_into().unwrap_or([0; 4]),
+                                    ) as i64,
+                                };
+                                b.append_value(val);
                             }
-                        }
-                        ColBuilder::Text(b) => {
-                            if let Some(slice) = row_data.get(start..end) {
-                                b.append_value(DataEngine::decode_db_string(slice));
-                            } else {
-                                b.append_null();
+                            ColBuilder::Float(b) => {
+                                let v = f64::from_le_bytes(
+                                    row_data[start..start + 8].try_into().unwrap_or([0; 8]),
+                                );
+                                b.append_value(v);
                             }
-                        }
-                        ColBuilder::Bool(b) => {
-                            let v = row_data[start];
-                            b.append_value(v != 0);
+                            ColBuilder::Date(b) => {
+                                let days = i32::from_le_bytes(
+                                    row_data[start..start + 4].try_into().unwrap_or([0; 4]),
+                                );
+                                if days > 0 {
+                                    b.append_value(days - 719163);
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            ColBuilder::Text(b) => {
+                                if let Some(slice) = row_data.get(start..end) {
+                                    b.append_value(DataEngine::decode_db_string(slice));
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            ColBuilder::Bool(b) => {
+                                b.append_value(row_data[start] != 0);
+                            }
                         }
                     }
+                    local_count += 1;
                 }
-                count += 1;
-                chunk_count += 1;
             }
         }
-        i += config.record_size as usize;
 
-        if chunk_count >= CHUNK_SIZE {
-            send_batch(&table_name, &arrow_schema, &mut builders, chunk_count, &tx)?;
-            chunk_count = 0;
+        if local_count > 0 {
+            send_batch(
+                &table_name,
+                &arrow_schema,
+                &mut local_builders,
+                local_count,
+                &tx,
+            )?;
         }
-    }
 
-    if chunk_count > 0 {
-        send_batch(&table_name, &arrow_schema, &mut builders, chunk_count, &tx)?;
-    }
+        Ok(())
+    })?;
 
     Ok(())
+}
+
+fn create_builders_from_cols(target_columns: &[Column]) -> Vec<ColBuilder> {
+    target_columns
+        .iter()
+        .map(|col| match col.field_type.as_str() {
+            "I" => {
+                if col.length == 1 {
+                    ColBuilder::Bool(BooleanBuilder::new())
+                } else {
+                    ColBuilder::Int(Int64Builder::new())
+                }
+            }
+            "F" => ColBuilder::Float(Float64Builder::new()),
+            "D" => ColBuilder::Date(Date32Builder::new()),
+            _ => ColBuilder::Text(StringBuilder::new()),
+        })
+        .collect()
 }
 
 fn send_batch(

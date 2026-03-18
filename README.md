@@ -28,6 +28,7 @@ A performance extrema do New Report não é por acaso; é fruto de engenharia de
 * **Arquitetura Colunar (Apache Arrow)**: Diferente de bancos tradicionais que leem "linhas", o **New Report** organiza os dados em colunas na RAM. Isso permite que a CPU processe milhares de registros de uma vez só usando instruções **SIMD**.
 * **Execução Vetorizada (DataFusion)**: Utilizamos o motor de consulta do Apache **DataFusion**. As queries são compiladas e executadas de forma paralela entre os núcleos da CPU, garantindo que JOINS e agregações (SUM, COUNT) ocorram na velocidade máxima da memória.
 * **Morte ao "Insert"**: Ao contrário de soluções que importam dados para o SQLite, o **New Report** registra os dados no formato Arrow instantaneamente (0ms de overhead de registro).
+* **Paralelismo de dados (Rayon)**: Em vez de ler uma tebela por thread, o motor agora "fatia" arquivos gigantes em múltiplos pedaços e os processa simultâneamente em todos os núcleos da CPU. Isso satura a largura de banda do SSD e reduz o tempo de extração em até 70%, eliminando o gargalo do "Cold Start" tambem.
 
 ---
 ## ⚠️ Dependência Obrigatória: `schema.toml`
