@@ -10,6 +10,7 @@ use crate::core::engine::DataEngine;
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::path::Path;
+use std::env;
 use views::editor::EditQuery;
 use views::home::Home;
 use views::report::ViewReport;
@@ -22,6 +23,18 @@ enum Route {
 }
 
 fn main() {
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let runtime_path = exe_dir.join("webview_runtime");
+            
+            if runtime_path.exists() {
+                unsafe {
+                    env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", runtime_path.to_str().unwrap());
+                }
+            }
+        }
+    }
+
     dotenvy::dotenv().ok();
 
     let config = Config::new().with_window(

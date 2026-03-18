@@ -2,3 +2,4 @@
 relatorios/
 .env
 schema.toml
+/webview_runtime
