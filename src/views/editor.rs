@@ -166,7 +166,11 @@ fn SqlTab(query_text: Signal<String>) -> Element {
 }
 
 #[component]
-pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: EventHandler<MouseEvent>) -> Element {
+pub fn EditQuery(
+    report_name: String,
+    engine: Signal<DataEngine>,
+    on_back: EventHandler<MouseEvent>,
+) -> Element {
     let mut active_tab = use_signal(|| EditorTab::Info);
     let mut query_text = use_signal(|| String::new());
     let mut description = use_signal(|| String::new());
@@ -236,7 +240,7 @@ pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: Event
         }
 
         let schema_map = engine.read().schema.clone();
-        
+
         let test_ctx = datafusion::prelude::SessionContext::new();
 
         let re_header = regex::Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
@@ -259,7 +263,10 @@ pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: Event
         }
 
         for table_name in tables_to_mock {
-            match schema_map.iter().find(|(k, _)| k.to_lowercase() == table_name) {
+            match schema_map
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == table_name)
+            {
                 Some((_, config)) => {
                     let mut arrow_fields = Vec::new();
                     for col in &config.columns {
@@ -274,11 +281,16 @@ pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: Event
                     let schema = Arc::new(ArrowSchema::new(arrow_fields));
                     let empty_batch = RecordBatch::new_empty(schema.clone());
                     let mem_table = MemTable::try_new(schema, vec![vec![empty_batch]]).unwrap();
-                    
-                    test_ctx.register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table)).unwrap();
+
+                    test_ctx
+                        .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
+                        .unwrap();
                 }
                 None => {
-                    status_msg.set(format!("Tabela '{}' não existe no arquivo schema.toml!", table_name));
+                    status_msg.set(format!(
+                        "Tabela '{}' não existe no arquivo schema.toml!",
+                        table_name
+                    ));
                     status_modal_type.set(StatusType::Error);
                     show_status_modal.set(true);
                     return;
@@ -401,12 +413,27 @@ pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: Event
         };
 
         if let Ok(json_content) = serde_json::to_string_pretty(&data) {
-            if fs::write(&path_to_save, json_content).is_ok() {
+            let tmp_path = path_to_save.with_extension("tmp");
+
+            if fs::write(&tmp_path, &json_content).is_ok() {
+                if fs::rename(&tmp_path, &path_to_save).is_err() {
+                    let _ = fs::write(&path_to_save, &json_content);
+                    let _ = fs::remove_file(&tmp_path);
+                }
+
                 let old_path = Path::new(&report_name_original);
                 if path_to_save != old_path && old_path.exists() {
                     let _ = fs::remove_file(old_path);
                 }
+
                 on_back_action.call(e);
+            } else {
+                status_msg.set(
+                    "Falha ao gravar arquivo temporário no disco. Verifique as permissões."
+                        .to_string(),
+                );
+                status_modal_type.set(StatusType::Error);
+                show_status_modal.set(true);
             }
         }
     };
