@@ -166,7 +166,7 @@ fn SqlTab(query_text: Signal<String>) -> Element {
 }
 
 #[component]
-pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Element {
+pub fn EditQuery(report_name: String, engine: Signal<DataEngine>, on_back: EventHandler<MouseEvent>) -> Element {
     let mut active_tab = use_signal(|| EditorTab::Info);
     let mut query_text = use_signal(|| String::new());
     let mut description = use_signal(|| String::new());
@@ -235,7 +235,10 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
             return;
         }
 
-        let engine = DataEngine::new();
+        let schema_map = engine.read().schema.clone();
+        
+        let test_ctx = datafusion::prelude::SessionContext::new();
+
         let re_header = regex::Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
         let re_table = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\((.*?)\)").unwrap();
 
@@ -256,11 +259,7 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
         }
 
         for table_name in tables_to_mock {
-            match engine
-                .schema
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == table_name)
-            {
+            match schema_map.iter().find(|(k, _)| k.to_lowercase() == table_name) {
                 Some((_, config)) => {
                     let mut arrow_fields = Vec::new();
                     for col in &config.columns {
@@ -275,16 +274,11 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                     let schema = Arc::new(ArrowSchema::new(arrow_fields));
                     let empty_batch = RecordBatch::new_empty(schema.clone());
                     let mem_table = MemTable::try_new(schema, vec![vec![empty_batch]]).unwrap();
-                    engine
-                        .ctx
-                        .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
-                        .unwrap();
+                    
+                    test_ctx.register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table)).unwrap();
                 }
                 None => {
-                    status_msg.set(format!(
-                        "Tabela '{}' não existe no arquivo schema.toml!",
-                        table_name
-                    ));
+                    status_msg.set(format!("Tabela '{}' não existe no arquivo schema.toml!", table_name));
                     status_modal_type.set(StatusType::Error);
                     show_status_modal.set(true);
                     return;
@@ -329,7 +323,7 @@ pub fn EditQuery(report_name: String, on_back: EventHandler<MouseEvent>) -> Elem
                 .unwrap();
             rt.block_on(async {
                 for cmd in commands {
-                    if let Err(e) = engine.ctx.sql(&cmd).await {
+                    if let Err(e) = test_ctx.sql(&cmd).await {
                         return Err(e.to_string());
                     }
                 }

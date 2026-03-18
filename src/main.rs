@@ -108,6 +108,7 @@ fn App() -> Element {
         Route::EditQuery => rsx! {
             EditQuery {
                 report_name: selected_report(),
+                engine: engine_signal,
                 on_back: move |_: MouseEvent| current_route.set(Route::Home)
             }
         },
