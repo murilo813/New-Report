@@ -274,14 +274,14 @@ fn ParamsModal(
 
                                                         spawn(async move {
                                                             let (tx, rx) = std::sync::mpsc::channel();
-    
+
                                                             std::thread::spawn(move || {
-                                                                let mut main_engine = engine_instance; 
+                                                                let mut main_engine = engine_instance;
                                                                 let cancel = Arc::new(AtomicBool::new(false));
 
                                                                 if let Ok(_) = main_engine.process_report_with_progress(&sql_for_spawn, cancel, "Pesquisa Lookup", |_| {}) {
                                                                     if let Ok((cols, _total)) = main_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
-                                                                        let rows = main_engine.get_rows_slice(0, 1000); 
+                                                                        let rows = main_engine.get_rows_slice(0, 1000);
                                                                         let _ = tx.send(Ok((cols, rows)));
                                                                         return;
                                                                     }
@@ -290,11 +290,11 @@ fn ParamsModal(
                                                             });
 
                                                             if let Ok(res) = rx.recv() {
-                                                                match res { 
-                                                                    Ok(data) => { 
-                                                                        lookup_data.set(data); 
-                                                                        show_lookup.set(true); 
-                                                                    } 
+                                                                match res {
+                                                                    Ok(data) => {
+                                                                        lookup_data.set(data);
+                                                                        show_lookup.set(true);
+                                                                    }
                                                                     Err(e) => {
                                                                         validation_error.set(e);
                                                                     }
@@ -512,13 +512,13 @@ pub fn Home(
                 on_close: move |_| show_status_modal.set(false)
             }
             LogsModal { show: show_logs, on_close: move |_| show_logs.set(false) }
-            ParamsModal { 
-                show: show_params_modal, 
-                report_config: current_report_config, 
-                report_path: current_report_path, 
-                engine: engine, 
-                on_close: move |_| show_params_modal.set(false), 
-                on_generate: execute_report 
+            ParamsModal {
+                show: show_params_modal,
+                report_config: current_report_config,
+                report_path: current_report_path,
+                engine: engine,
+                on_close: move |_| show_params_modal.set(false),
+                on_generate: execute_report
             }
 
             div { class: "middle-section",

@@ -126,7 +126,7 @@ fn ParametrosTab(
                             label { "Tipo do Campo" }
                             select { class: "input-classic input-h28", value: "{parameters.read()[idx].tipo}",
                                 onchange: move |evt| { if let Some(i) = *selected_param_idx.read() { parameters.write()[i].tipo = evt.value(); } },
-                                option { value: "string", "Texto (String)" } option { value: "int", "Inteiro (Número Exato)" }
+                                option { value: "string", "Texto (String)" } option { value: "int", "Inteiro (Número inteiro)" }
                                 option { value: "float", "Decimal (Moeda / Quantidade)" } option { value: "data", "Data" } option { value: "pesquisa", "Pesquisa (Busca com SQL)" }
                             }
                         }
@@ -141,7 +141,7 @@ fn ParametrosTab(
                             label { class: "checkbox-label", "Campo Obrigatório" }
                         }
                         div { class: "form-group mt-15",
-                            label { "Parâmetros Extras (Ex: SQL de pesquisa com tag [SYNC: ...])" }
+                            label { "Parâmetros Extras (Ex: SQL de pesquisa com tag [SYNC: produtosprincipal(descricao)])" }
                             textarea { class: "input-classic extra-sql-area", value: "{parameters.read()[idx].extra}", oninput: move |evt| { if let Some(i) = *selected_param_idx.read() { parameters.write()[i].extra = evt.value(); } } }
                         }
                     }
@@ -367,7 +367,7 @@ pub fn EditQuery(
                     "Erro de sintaxe SQL ou coluna não encontrada.\n(Verifique o uso de maiúsculas e minúsculas)".to_string()
                 } else {
                     format!(
-                        "{}\n\n(Dica: O DataFusion é sensível a maiúsculas/minúsculas. Se o schema.toml está minúsculo, use minúsculo no SQL ou coloque aspas duplas, ex: \"ID\")",
+                        "{}\n\n💡 Dica: Verifique se os nomes das colunas estão corretos no 'schema.toml' e se todos os JOINs possuem as colunas de ligação.",
                         clean_error
                     )
                 };
