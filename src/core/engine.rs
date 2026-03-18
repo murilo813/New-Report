@@ -42,6 +42,7 @@ pub struct TableConfig {
     pub columns: Vec<Column>,
 }
 
+#[derive(Clone)]
 pub struct DataEngine {
     pub ctx: SessionContext,
     pub schema: BTreeMap<String, TableConfig>,

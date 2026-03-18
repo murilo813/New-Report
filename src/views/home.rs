@@ -174,6 +174,7 @@ fn ParamsModal(
     show: Signal<bool>,
     report_config: Signal<Option<ReportConfig>>,
     report_path: Signal<String>,
+    engine: Signal<DataEngine>,
     on_close: EventHandler<()>,
     on_generate: EventHandler<(String, String)>,
 ) -> Element {
@@ -269,20 +270,18 @@ fn ParamsModal(
                                                         is_lookup_loading.set(true);
 
                                                         let sql_for_spawn = extra_sql.clone();
+                                                        let engine_instance = (*engine.read()).clone();
 
                                                         spawn(async move {
                                                             let (tx, rx) = std::sync::mpsc::channel();
-                                                            
+    
                                                             std::thread::spawn(move || {
-                                                                let mut tmp_engine = DataEngine::new();
+                                                                let mut main_engine = engine_instance; 
                                                                 let cancel = Arc::new(AtomicBool::new(false));
 
-                                                                if let Ok(_) = tmp_engine.process_report_with_progress(&sql_for_spawn, cancel, "Pesquisa Lookup", |_| {}) {
-                                                                    
-                                                                    if let Ok((cols, _total)) = tmp_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
-                                                                        
-                                                                        let rows = tmp_engine.get_rows_slice(0, 1000); 
-                                                                        
+                                                                if let Ok(_) = main_engine.process_report_with_progress(&sql_for_spawn, cancel, "Pesquisa Lookup", |_| {}) {
+                                                                    if let Ok((cols, _total)) = main_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
+                                                                        let rows = main_engine.get_rows_slice(0, 1000); 
                                                                         let _ = tx.send(Ok((cols, rows)));
                                                                         return;
                                                                     }
@@ -513,7 +512,14 @@ pub fn Home(
                 on_close: move |_| show_status_modal.set(false)
             }
             LogsModal { show: show_logs, on_close: move |_| show_logs.set(false) }
-            ParamsModal { show: show_params_modal, report_config: current_report_config, report_path: current_report_path, on_close: move |_| show_params_modal.set(false), on_generate: execute_report }
+            ParamsModal { 
+                show: show_params_modal, 
+                report_config: current_report_config, 
+                report_path: current_report_path, 
+                engine: engine, 
+                on_close: move |_| show_params_modal.set(false), 
+                on_generate: execute_report 
+            }
 
             div { class: "middle-section",
                 div { class: "sidebar",
