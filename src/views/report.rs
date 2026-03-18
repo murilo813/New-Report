@@ -11,6 +11,8 @@ pub fn ViewReport(
     let mut show_status_modal = use_signal(|| false);
     let mut status_modal_type = use_signal(|| StatusType::Error);
     let mut status_msg = use_signal(|| String::new());
+    
+    let mut modal_sql_content = use_signal(|| String::new());
 
     let mut headers = use_signal(|| Vec::<String>::new());
     let mut visible_rows = use_signal(|| Vec::<Vec<String>>::new());
@@ -25,32 +27,32 @@ pub fn ViewReport(
 
         async move {
             let start_time = std::time::Instant::now();
-            
             let res = engine_handle.read().execute_user_sql(&sql, "Tela de Visualização");
 
-            if let Ok((cols, total)) = &res { 
-                headers.set(cols.clone()); 
-                total_rows_count.set(*total);
-                
-                let first_chunk = engine_handle.read().get_rows_slice(0, 200);
-                visible_rows.set(first_chunk);
-                current_offset.set(200);
+            match &res {
+                Ok((cols, total)) => {
+                    headers.set(cols.clone());
+                    total_rows_count.set(*total);
+                    let first_chunk = engine_handle.read().get_rows_slice(0, 200);
+                    visible_rows.set(first_chunk);
+                    current_offset.set(200);
+                }
+                Err(e) => {
+                    status_msg.set(e.clone());
+                    status_modal_type.set(StatusType::Error);
+                    modal_sql_content.set(sql.clone());
+                    show_status_modal.set(true);
+                }
             }
 
-            append_log(
-                "Visualização", 
-                "Execução SQL e Carga Inicial 200", 
-                start_time.elapsed().as_millis()
-            );
+            append_log("Visualização", "Carga Inicial 200", start_time.elapsed().as_millis());
             res
         }
     });
 
-
     let load_more = move |_| {
         let offset = current_offset();
         let next_chunk = engine.read().get_rows_slice(offset, 200);
-        
         visible_rows.write().extend(next_chunk);
         current_offset.set(offset + 200);
     };
@@ -74,6 +76,9 @@ pub fn ViewReport(
             if let Ok(_) = std::fs::write(&path, file_content) {
                 status_msg.set(format!("Exportado com sucesso para:\n{}", path.display()));
                 status_modal_type.set(StatusType::Success);
+                
+                modal_sql_content.set(String::new()); 
+                
                 show_status_modal.set(true);
             }
         }
@@ -91,7 +96,7 @@ pub fn ViewReport(
                 show: show_status_modal,
                 status: status_modal_type(),
                 message: status_msg(),
-                sql_content: query_sql.clone(),
+                sql_content: modal_sql_content(), 
                 on_close: move |_| show_status_modal.set(false)
             }
 
@@ -111,13 +116,7 @@ pub fn ViewReport(
                              div { class: "empty-msg", "Sem resultados para esta consulta." }
                         } else {
                             table { class: "pg-table table-wrapper",
-                                thead {
-                                    tr {
-                                        for h in headers.read().iter() {
-                                            th { key: "{h}", class: "sticky-header", "{h}" }
-                                        }
-                                    }
-                                }
+                                thead { tr { for h in headers.read().iter() { th { key: "{h}", class: "sticky-header", "{h}" } } } }
                                 tbody {
                                     for (i, row) in visible_rows.read().iter().enumerate() {
                                         tr { key: "{i}",
@@ -128,7 +127,6 @@ pub fn ViewReport(
                                     }
                                 }
                             }
-                            
                             if current_offset() < total_rows_count() {
                                 div { 
                                     class: "load-more-btn", 
