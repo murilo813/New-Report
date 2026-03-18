@@ -16,7 +16,7 @@ use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -26,7 +26,7 @@ const DBISAM_OFFSET_TOTAL_ROWS: std::ops::Range<usize> = 0x29..0x2D;
 const DBISAM_OFFSET_TOTAL_FIELDS: std::ops::Range<usize> = 0x2F..0x31;
 const DBISAM_BASE_HEADER_SIZE: usize = 0x200; // 512 bytes
 const DBISAM_FIELD_DEF_SIZE: usize = 768;
-const CHUNK_SIZE: usize = 50_000;
+const CHUNK_SIZE: usize = 100_000;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Column {
@@ -46,6 +46,7 @@ pub struct DataEngine {
     pub ctx: SessionContext,
     pub schema: BTreeMap<String, TableConfig>,
     pub base_path: String,
+    pub cached_results: Arc<Mutex<Vec<RecordBatch>>>,
 }
 
 enum WorkerMsg {
@@ -71,6 +72,7 @@ impl DataEngine {
             ctx: SessionContext::new(),
             schema: BTreeMap::new(),
             base_path: String::new(),
+            cached_results: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -106,6 +108,7 @@ impl DataEngine {
             ctx: SessionContext::new(),
             schema,
             base_path,
+            cached_results: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -312,7 +315,7 @@ impl DataEngine {
         &self,
         sql: &str,
         report_name: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, usize), String> {
         let start_sql = std::time::Instant::now();
 
         let re_sync = Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").map_err(|e| e.to_string())?;
@@ -329,6 +332,7 @@ impl DataEngine {
         }
 
         let ctx = self.ctx.clone();
+        let cache_ptr = self.cached_results.clone();
 
         let result = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -338,62 +342,68 @@ impl DataEngine {
 
             rt.block_on(async move {
                 for i in 0..(commands.len() - 1) {
-                    let cmd = &commands[i];
-                    ctx.sql(cmd)
-                        .await
-                        .map_err(|e| format!("Erro no comando {}: {}", cmd, e))?;
+                    ctx.sql(&commands[i]).await.map_err(|e| e.to_string())?;
                 }
 
                 let last_query = commands.last().unwrap();
-                let df = ctx
-                    .sql(last_query)
-                    .await
-                    .map_err(|e| format!("Erro no SELECT final: {}", e))?;
+                let df = ctx.sql(last_query).await.map_err(|e| e.to_string())?;
 
-                let batches = df
-                    .collect()
-                    .await
-                    .map_err(|e| format!("Erro ao coletar dados: {}", e))?;
+                let batches = df.collect().await.map_err(|e| e.to_string())?;
 
+                let mut total_rows = 0;
                 let mut cols = Vec::new();
-                let mut rows_vec = Vec::new();
 
                 if !batches.is_empty() {
                     let schema = batches[0].schema();
                     cols = schema.fields().iter().map(|f| f.name().clone()).collect();
-
-                    for batch in batches {
-                        let num_rows = batch.num_rows();
-                        let num_cols = batch.num_columns();
-
-                        for row_idx in 0..num_rows {
-                            let mut row_data = Vec::with_capacity(num_cols);
-                            for col_idx in 0..num_cols {
-                                let array = batch.column(col_idx);
-                                let val_str =
-                                    datafusion::arrow::util::display::array_value_to_string(
-                                        array, row_idx,
-                                    )
-                                    .unwrap_or_default();
-                                row_data.push(val_str);
-                            }
-                            rows_vec.push(row_data);
-                        }
-                    }
+                    total_rows = batches.iter().map(|b| b.num_rows()).sum();
                 }
-                Ok((cols, rows_vec))
+
+                let mut cache = cache_ptr.lock().unwrap();
+                *cache = batches;
+
+                Ok((cols, total_rows))
             })
-        })
-        .join()
-        .unwrap_or_else(|_| {
-            Err("Panic: Erro crítico na thread do DataFusion ao tentar renderizar.".to_string())
-        });
+        }).join().unwrap_or(Err("Erro crítico na thread do SQL".into()));
 
         let tempo_sql = start_sql.elapsed().as_millis();
-        println!("⏱️ [EXECUÇÃO DATAFUSION] {} ms", tempo_sql);
-        append_log(report_name, "3. Execução Vetorizada DataFusion", tempo_sql);
+        append_log(report_name, "3. Execução SQL (DataFusion)", tempo_sql);
 
         result
+    }
+
+    pub fn get_rows_slice(&self, offset: usize, limit: usize) -> Vec<Vec<String>> {
+        let cache = self.cached_results.lock().unwrap();
+        let mut rows_vec = Vec::new();
+        let mut current_idx = 0;
+
+        for batch in cache.iter() {
+            let num_rows = batch.num_rows();
+            
+            if current_idx + num_rows <= offset {
+                current_idx += num_rows;
+                continue;
+            }
+
+            let num_cols = batch.num_columns();
+            for row_idx in 0..num_rows {
+                if current_idx >= offset && rows_vec.len() < limit {
+                    let mut row_data = Vec::with_capacity(num_cols);
+                    for col_idx in 0..num_cols {
+                        let array = batch.column(col_idx);
+                        let val_str = datafusion::arrow::util::display::array_value_to_string(
+                            array, row_idx,
+                        ).unwrap_or_default();
+                        row_data.push(val_str);
+                    }
+                    rows_vec.push(row_data);
+                }
+                current_idx += 1;
+                if rows_vec.len() >= limit { break; }
+            }
+            if rows_vec.len() >= limit { break; }
+        }
+        rows_vec
     }
 }
 

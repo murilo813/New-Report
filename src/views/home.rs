@@ -269,22 +269,37 @@ fn ParamsModal(
                                                         is_lookup_loading.set(true);
 
                                                         let sql_for_spawn = extra_sql.clone();
+
                                                         spawn(async move {
                                                             let (tx, rx) = std::sync::mpsc::channel();
+                                                            
                                                             std::thread::spawn(move || {
                                                                 let mut tmp_engine = DataEngine::new();
                                                                 let cancel = Arc::new(AtomicBool::new(false));
 
                                                                 if let Ok(_) = tmp_engine.process_report_with_progress(&sql_for_spawn, cancel, "Pesquisa Lookup", |_| {}) {
-                                                                    if let Ok((cols, rows)) = tmp_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
+                                                                    
+                                                                    if let Ok((cols, _total)) = tmp_engine.execute_user_sql(&sql_for_spawn, "Pesquisa Lookup") {
+                                                                        
+                                                                        let rows = tmp_engine.get_rows_slice(0, 1000); 
+                                                                        
                                                                         let _ = tx.send(Ok((cols, rows)));
                                                                         return;
                                                                     }
                                                                 }
                                                                 let _ = tx.send(Err("Erro ao processar SQL de pesquisa.".to_string()));
                                                             });
+
                                                             if let Ok(res) = rx.recv() {
-                                                                match res { Ok(data) => { lookup_data.set(data); show_lookup.set(true); } Err(e) => validation_error.set(e), }
+                                                                match res { 
+                                                                    Ok(data) => { 
+                                                                        lookup_data.set(data); 
+                                                                        show_lookup.set(true); 
+                                                                    } 
+                                                                    Err(e) => {
+                                                                        validation_error.set(e);
+                                                                    }
+                                                                }
                                                             }
                                                             is_lookup_loading.set(false);
                                                         });

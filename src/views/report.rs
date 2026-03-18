@@ -12,89 +12,77 @@ pub fn ViewReport(
     let mut status_modal_type = use_signal(|| StatusType::Error);
     let mut status_msg = use_signal(|| String::new());
 
-    let mut max_visible = use_signal(|| 1000);
+    let mut headers = use_signal(|| Vec::<String>::new());
+    let mut visible_rows = use_signal(|| Vec::<Vec<String>>::new());
+    let mut total_rows_count = use_signal(|| 0usize);
+    let mut current_offset = use_signal(|| 0usize);
 
     let sql_to_query = query_sql.clone();
 
-    let report_data = use_resource(move || {
-        let current_engine = engine.clone();
+    let report_task = use_resource(move || {
+        let engine_handle = engine;
         let sql = sql_to_query.clone();
 
         async move {
             let start_time = std::time::Instant::now();
+            
+            let res = engine_handle.read().execute_user_sql(&sql, "Tela de Visualização");
 
-            let engine_handle = current_engine.read();
+            if let Ok((cols, total)) = &res { 
+                headers.set(cols.clone()); 
+                total_rows_count.set(*total);
+                
+                let first_chunk = engine_handle.read().get_rows_slice(0, 200);
+                visible_rows.set(first_chunk);
+                current_offset.set(200);
+            }
 
-            let res = match engine_handle.execute_user_sql(&sql, "Tela de Visualização") {
-                Ok((cols, rows_vec)) => (cols, rows_vec),
-                Err(e) => (vec!["ERRO".to_string()], vec![vec![e]]),
-            };
-
-            let elapsed_ms = start_time.elapsed().as_millis();
             append_log(
-                "Visualização do Relatório",
-                "Execução da Query DATAFUSION e Renderização",
-                elapsed_ms,
+                "Visualização", 
+                "Execução SQL e Carga Inicial 200", 
+                start_time.elapsed().as_millis()
             );
-
             res
         }
     });
 
-    let (headers, all_rows) = match &*report_data.read() {
-        Some((h, r)) => (h.clone(), r.clone()),
-        None => (vec!["Processando...".to_string()], vec![]),
+
+    let load_more = move |_| {
+        let offset = current_offset();
+        let next_chunk = engine.read().get_rows_slice(offset, 200);
+        
+        visible_rows.write().extend(next_chunk);
+        current_offset.set(offset + 200);
     };
-
-    let total_rows = all_rows.len();
-
-    let headers_export = headers.clone();
-    let rows_export = all_rows.clone();
 
     let export_csv = move |_| {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Salvar Relatório CSV")
             .add_filter("Planilha CSV", &["csv"])
-            .save_file()
+            .save_file() 
         {
+            let all_data = engine.read().get_rows_slice(0, total_rows_count());
             let mut file_content = String::new();
-            file_content.push_str(&headers_export.join(";"));
+            file_content.push_str(&headers.read().join(";"));
             file_content.push('\n');
 
-            for row in &rows_export {
+            for row in all_data {
                 file_content.push_str(&row.join(";"));
                 file_content.push('\n');
             }
 
             if let Ok(_) = std::fs::write(&path, file_content) {
-                status_msg.set(format!(
-                    "Relatório exportado com sucesso para:\n{}",
-                    path.display()
-                ));
+                status_msg.set(format!("Exportado com sucesso para:\n{}", path.display()));
                 status_modal_type.set(StatusType::Success);
-                show_status_modal.set(true);
-            } else {
-                status_msg.set("Erro ao escrever arquivo CSV.".to_string());
-                status_modal_type.set(StatusType::Error);
                 show_status_modal.set(true);
             }
         }
     };
 
-    let end_idx = max_visible().min(total_rows);
-    let visible_rows = if total_rows > 0 {
-        &all_rows[0..end_idx]
+    let status_text = if report_task.read().is_none() {
+        "Processando Consulta no Motor DataFusion...".to_string()
     } else {
-        &[]
-    };
-    let displayed_count = visible_rows.len();
-
-    let status_text = if report_data.read().is_none() {
-        "Processando Consulta SQL no Motor DataFusion...".to_string()
-    } else if total_rows == 0 {
-        "Consulta concluída: Nenhum registro encontrado para os filtros selecionados.".to_string()
-    } else {
-        format!("Exibindo {} de {} registros", displayed_count, total_rows)
+        format!("Exibindo {} de {} registros", visible_rows.read().len(), total_rows_count())
     };
 
     rsx! {
@@ -109,44 +97,30 @@ pub fn ViewReport(
 
             div { class: "middle-section",
                 div { class: "sidebar",
-                    button {
-                        class: "btn-classic",
-                        onclick: move |evt| on_back.call(evt),
-                        "🏠 Voltar"
-                    }
-                    button {
-                        class: "btn-classic",
-                        onclick: export_csv,
-                        "💾 Exportar CSV"
-                    }
+                    button { class: "btn-classic", onclick: move |evt| on_back.call(evt), "🏠 Voltar" }
+                    button { class: "btn-classic", onclick: export_csv, "💾 Exportar CSV" }
                 }
 
                 div { class: "main-view report-view-container",
-                    div { class: "top-toolbar",
-                        span { class: "folder-name", "Visualização de Dados" }
-                    }
+                    div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados (Lazy Loading)" } }
+                    
                     div { class: "data-container",
-                        if report_data.read().is_none() {
+                        if report_task.read().is_none() {
                             div { class: "empty-msg", "Analisando dados, por favor aguarde..." }
-                        } else if total_rows == 0 {
-                             div { class: "empty-msg", "Sem resultados. Revise os parâmetros da consulta." }
+                        } else if total_rows_count() == 0 {
+                             div { class: "empty-msg", "Sem resultados para esta consulta." }
                         } else {
                             table { class: "pg-table table-wrapper",
                                 thead {
                                     tr {
-                                        for h in headers.iter() {
-                                            th {
-                                                key: "{h}",
-                                                class: "sticky-header",
-                                                "{h}"
-                                            }
+                                        for h in headers.read().iter() {
+                                            th { key: "{h}", class: "sticky-header", "{h}" }
                                         }
                                     }
                                 }
                                 tbody {
-                                    for (i, row) in visible_rows.iter().enumerate() {
-                                        tr {
-                                            key: "{i}",
+                                    for (i, row) in visible_rows.read().iter().enumerate() {
+                                        tr { key: "{i}",
                                             for (j, cell) in row.iter().enumerate() {
                                                 td { key: "{j}", "{cell}" }
                                             }
@@ -154,15 +128,13 @@ pub fn ViewReport(
                                     }
                                 }
                             }
-                        }
-
-                        if displayed_count > 0 && displayed_count < total_rows {
-                            div {
-                                class: "load-more-btn",
-                                onclick: move |_| {
-                                    max_visible.set(max_visible() + 1000);
-                                },
-                                "⬇️ Rolar para carregar mais registros..."
+                            
+                            if current_offset() < total_rows_count() {
+                                div { 
+                                    class: "load-more-btn", 
+                                    onclick: load_more,
+                                    "⬇️ Mostrar mais 200 registros..."
+                                }
                             }
                         }
                     }
