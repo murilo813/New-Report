@@ -12,7 +12,7 @@ pub fn ViewReport(
     let mut show_status_modal = use_signal(|| false);
     let mut status_modal_type = use_signal(|| StatusType::Error);
     let mut status_msg = use_signal(|| String::new());
-    
+
     let mut modal_sql_content = use_signal(|| String::new());
 
     let mut headers = use_signal(|| Vec::<String>::new());
@@ -28,7 +28,9 @@ pub fn ViewReport(
 
         async move {
             let start_time = std::time::Instant::now();
-            let res = engine_handle.read().execute_user_sql(&sql, "Tela de Visualização");
+            let res = engine_handle
+                .read()
+                .execute_user_sql(&sql, "Tela de Visualização");
 
             match &res {
                 Ok((cols, total)) => {
@@ -46,7 +48,11 @@ pub fn ViewReport(
                 }
             }
 
-            append_log("Visualização", "Carga Inicial 200", start_time.elapsed().as_millis());
+            append_log(
+                "Visualização",
+                "Carga Inicial 200",
+                start_time.elapsed().as_millis(),
+            );
             res
         }
     });
@@ -62,26 +68,46 @@ pub fn ViewReport(
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Salvar Relatório CSV")
             .add_filter("Planilha CSV", &["csv"])
-            .save_file() 
+            .save_file()
         {
-            let all_data = engine.read().get_rows_slice(0, total_rows_count());
-            let mut file_content = String::new();
-            file_content.push_str(&headers.read().join(";"));
-            file_content.push('\n');
+            let engine_instance = (*engine.read()).clone();
+            let total = total_rows_count();
+            let cols = headers.read().clone();
+            let path_display = path.display().to_string();
 
-            for row in all_data {
-                file_content.push_str(&row.join(";"));
-                file_content.push('\n');
-            }
+            status_msg.set("⏳ Gerando arquivo CSV...".to_string());
+            status_modal_type.set(StatusType::Success);
+            modal_sql_content.set(String::new());
+            show_status_modal.set(true);
 
-            if let Ok(_) = std::fs::write(&path, file_content) {
-                status_msg.set(format!("Exportado com sucesso para:\n{}", path.display()));
-                status_modal_type.set(StatusType::Success);
-                
-                modal_sql_content.set(String::new()); 
-                
-                show_status_modal.set(true);
-            }
+            spawn(async move {
+                let export_result = tokio::task::spawn_blocking(move || {
+                    let all_data = engine_instance.get_rows_slice(0, total);
+                    let mut file_content = String::with_capacity(total * 100);
+
+                    file_content.push_str(&cols.join(";"));
+                    file_content.push('\n');
+
+                    for row in all_data {
+                        file_content.push_str(&row.join(";"));
+                        file_content.push('\n');
+                    }
+
+                    std::fs::write(&path, file_content)
+                })
+                .await;
+
+                match export_result {
+                    Ok(Ok(_)) => {
+                        status_msg.set(format!("✅ Exportado com sucesso para:\n{}", path_display));
+                        status_modal_type.set(StatusType::Success);
+                    }
+                    _ => {
+                        status_msg.set("❌ Erro ao salvar o CSV. O arquivo pode estar aberto ou sem permissão.".to_string());
+                        status_modal_type.set(StatusType::Error);
+                    }
+                }
+            });
         }
     };
 
@@ -89,38 +115,82 @@ pub fn ViewReport(
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Salvar Relatório Excel")
             .add_filter("Planilha Excel", &["xlsx"])
-            .save_file() 
+            .save_file()
         {
-            let mut workbook = Workbook::new();
-            let worksheet = workbook.add_worksheet();
+            let engine_instance = (*engine.read()).clone();
+            let total = total_rows_count();
+            let cols = headers.read().clone();
+            let path_display = path.display().to_string();
 
-            let header_format = Format::new().set_bold();
+            status_msg.set("⏳ Processando colunas para o Excel...".to_string());
+            status_modal_type.set(StatusType::Success);
+            modal_sql_content.set(String::new());
+            show_status_modal.set(true);
 
-            for (col_idx, header_text) in headers.read().iter().enumerate() {
-                worksheet.write_with_format(0, col_idx as u16, header_text, &header_format).ok();
-            }
+            spawn(async move {
+                let export_result = tokio::task::spawn_blocking(move || {
+                    let mut workbook = Workbook::new();
+                    let worksheet = workbook.add_worksheet();
+                    let header_format = Format::new().set_bold();
 
-            let all_data = engine.read().get_rows_slice(0, total_rows_count());
+                    for (col_idx, header_text) in cols.iter().enumerate() {
+                        let _ = worksheet.write_with_format(
+                            0,
+                            col_idx as u16,
+                            header_text,
+                            &header_format,
+                        );
+                    }
 
-            for (row_idx, row_data) in all_data.iter().enumerate() {
-                for (col_idx, cell_value) in row_data.iter().enumerate() {
-                    worksheet.write((row_idx + 1) as u32, col_idx as u16, cell_value).ok();
+                    let all_data = engine_instance.get_rows_slice(0, total);
+
+                    for (row_idx, row_data) in all_data.iter().enumerate() {
+                        for (col_idx, cell_value) in row_data.iter().enumerate() {
+                            if let Ok(num) = cell_value.parse::<f64>() {
+                                let _ = worksheet.write_number(
+                                    (row_idx + 1) as u32,
+                                    col_idx as u16,
+                                    num,
+                                );
+                            } else {
+                                let _ = worksheet.write(
+                                    (row_idx + 1) as u32,
+                                    col_idx as u16,
+                                    cell_value,
+                                );
+                            }
+                        }
+                    }
+
+                    workbook.save(&path)
+                })
+                .await;
+
+                match export_result {
+                    Ok(Ok(_)) => {
+                        status_msg.set(format!("✅ Exportado com sucesso para: {}.", path_display));
+                        status_modal_type.set(StatusType::Success);
+                    }
+                    _ => {
+                        status_msg.set(
+                            "❌ Falha ao salvar o arquivo Excel. Verifique se ele não está aberto."
+                                .to_string(),
+                        );
+                        status_modal_type.set(StatusType::Error);
+                    }
                 }
-            }
-
-            if let Ok(_) = workbook.save(&path) {
-                status_msg.set(format!("Excel exportado com sucesso para:\n{}", path.display()));
-                status_modal_type.set(StatusType::Success);
-                modal_sql_content.set(String::new()); 
-                show_status_modal.set(true);
-            }
+            });
         }
     };
 
     let status_text = if report_task.read().is_none() {
         "Processando Consulta no Motor DataFusion...".to_string()
     } else {
-        format!("Exibindo {} de {} registros", visible_rows.read().len(), total_rows_count())
+        format!(
+            "Exibindo {} de {} registros",
+            visible_rows.read().len(),
+            total_rows_count()
+        )
     };
 
     rsx! {
@@ -129,7 +199,7 @@ pub fn ViewReport(
                 show: show_status_modal,
                 status: status_modal_type(),
                 message: status_msg(),
-                sql_content: modal_sql_content(), 
+                sql_content: modal_sql_content(),
                 on_close: move |_| show_status_modal.set(false)
             }
 
@@ -141,8 +211,8 @@ pub fn ViewReport(
                 }
 
                 div { class: "main-view report-view-container",
-                    div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados (Lazy Loading)" } }
-                    
+                    div { class: "top-toolbar", span { class: "folder-name", "Visualização de Dados" } }
+
                     div { class: "data-container",
                         if report_task.read().is_none() {
                             div { class: "empty-msg", "Analisando dados, por favor aguarde..." }
@@ -162,8 +232,8 @@ pub fn ViewReport(
                                 }
                             }
                             if current_offset() < total_rows_count() {
-                                div { 
-                                    class: "load-more-btn", 
+                                div {
+                                    class: "load-more-btn",
                                     onclick: load_more,
                                     "⬇️ Mostrar mais 200 registros..."
                                 }
