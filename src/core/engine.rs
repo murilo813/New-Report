@@ -50,6 +50,7 @@ pub struct DataEngine {
     pub schema: BTreeMap<String, TableConfig>,
     pub base_path: String,
     pub cached_results: Arc<Mutex<Vec<RecordBatch>>>,
+    pub active_tables: Arc<Mutex<HashSet<String>>>,
 }
 
 enum WorkerMsg {
@@ -77,6 +78,7 @@ impl DataEngine {
             schema: BTreeMap::new(),
             base_path: String::new(),
             cached_results: Arc::new(Mutex::new(Vec::new())),
+            active_tables: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -113,6 +115,7 @@ impl DataEngine {
             schema,
             base_path,
             cached_results: Arc::new(Mutex::new(Vec::new())),
+            active_tables: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -165,6 +168,13 @@ impl DataEngine {
         }
         if self.schema.is_empty() {
             return Err("schema.toml não encontrado ou vazio!".to_string());
+        }
+
+        {
+            let mut active = self.active_tables.lock().unwrap();
+            for (table_name, _) in &sync_tasks {
+                active.insert(table_name.to_lowercase());
+            }
         }
 
         let mut total_rows_overall = 0;
@@ -302,6 +312,10 @@ impl DataEngine {
                     break;
                 }
             }
+        }
+
+        if let Ok(mut active) = self.active_tables.lock() {
+            active.clear();
         }
 
         if let Some(err) = final_error {
@@ -443,7 +457,11 @@ impl DataEngine {
         }
     }
 
-    pub fn start_background_warming(base_path: String, reports_dir: String) {
+    pub fn start_background_warming(
+        base_path: String,
+        reports_dir: String,
+        active_tables: Arc<Mutex<HashSet<String>>>,
+    ) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -465,17 +483,27 @@ impl DataEngine {
                 }
             }
 
-            if unique_tables.is_empty() { return; }
+            if unique_tables.is_empty() {
+                return;
+            }
 
             for table in unique_tables {
                 let path = format!(r"{}\{}.dat", base_path, table);
                 if let Ok(mut file) = File::open(&path) {
-                    let mut buffer = vec![0u8; 8 * 1024 * 1024]; 
+                    let mut buffer = vec![0u8; 32 * 1024 * 1024];
+
                     while let Ok(n) = file.read(&mut buffer) {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
+
+                        while !active_tables.lock().unwrap().is_empty() {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+
+                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
     }

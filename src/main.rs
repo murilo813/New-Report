@@ -64,7 +64,8 @@ fn App() -> Element {
                 Ok(loaded_engine) => {
                     DataEngine::start_background_warming(
                         loaded_engine.base_path.clone(),
-                        "relatorios".to_string()
+                        "relatorios".to_string(),
+                        loaded_engine.active_tables.clone()
                     );
 
                     engine_signal.set(loaded_engine);
