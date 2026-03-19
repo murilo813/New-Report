@@ -458,33 +458,20 @@ fn parse_dbisam_table(
         .unwrap_or(0);
 
     let mut arrow_fields = Vec::new();
-    let mut builders: Vec<ColBuilder> = Vec::new();
 
     for col in &target_columns {
         let normalized_name = col.name.to_lowercase();
-
         match col.field_type.as_str() {
             "I" => {
                 if col.length == 1 {
                     arrow_fields.push(Field::new(&normalized_name, DataType::Boolean, true));
-                    builders.push(ColBuilder::Bool(BooleanBuilder::new()));
                 } else {
                     arrow_fields.push(Field::new(&normalized_name, DataType::Int64, true));
-                    builders.push(ColBuilder::Int(Int64Builder::new()));
                 }
             }
-            "F" => {
-                arrow_fields.push(Field::new(&normalized_name, DataType::Float64, true));
-                builders.push(ColBuilder::Float(Float64Builder::new()));
-            }
-            "D" => {
-                arrow_fields.push(Field::new(&normalized_name, DataType::Date32, true));
-                builders.push(ColBuilder::Date(Date32Builder::new()));
-            }
-            _ => {
-                arrow_fields.push(Field::new(&normalized_name, DataType::Utf8, true));
-                builders.push(ColBuilder::Text(StringBuilder::new()));
-            }
+            "F" => arrow_fields.push(Field::new(&normalized_name, DataType::Float64, true)),
+            "D" => arrow_fields.push(Field::new(&normalized_name, DataType::Date32, true)),
+            _ => arrow_fields.push(Field::new(&normalized_name, DataType::Utf8, true)),
         }
     }
 
@@ -496,7 +483,7 @@ fn parse_dbisam_table(
             return Err("Operação cancelada pelo usuário".to_string());
         }
 
-        let mut local_builders = create_builders_from_cols(&target_columns);
+        let mut local_builders = create_builders_from_cols(&target_columns, chunk.len());
         let mut local_count = 0;
 
         for &row_idx in chunk {
@@ -576,20 +563,23 @@ fn parse_dbisam_table(
     Ok(())
 }
 
-fn create_builders_from_cols(target_columns: &[Column]) -> Vec<ColBuilder> {
+fn create_builders_from_cols(target_columns: &[Column], capacity: usize) -> Vec<ColBuilder> {
     target_columns
         .iter()
         .map(|col| match col.field_type.as_str() {
             "I" => {
                 if col.length == 1 {
-                    ColBuilder::Bool(BooleanBuilder::new())
+                    ColBuilder::Bool(BooleanBuilder::with_capacity(capacity))
                 } else {
-                    ColBuilder::Int(Int64Builder::new())
+                    ColBuilder::Int(Int64Builder::with_capacity(capacity))
                 }
             }
-            "F" => ColBuilder::Float(Float64Builder::new()),
-            "D" => ColBuilder::Date(Date32Builder::new()),
-            _ => ColBuilder::Text(StringBuilder::new()),
+            "F" => ColBuilder::Float(Float64Builder::with_capacity(capacity)),
+            "D" => ColBuilder::Date(Date32Builder::with_capacity(capacity)),
+            _ => {
+                let estimated_bytes = capacity * 15; 
+                ColBuilder::Text(StringBuilder::with_capacity(capacity, estimated_bytes))
+            }
         })
         .collect()
 }
