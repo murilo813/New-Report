@@ -9,6 +9,10 @@ pub fn ViewReport(
     engine: Signal<DataEngine>,
     query_sql: String,
 ) -> Element {
+    use_drop(move || {
+        engine.write().clear_memory();
+    });
+
     let mut show_status_modal = use_signal(|| false);
     let mut status_modal_type = use_signal(|| StatusType::Error);
     let mut status_msg = use_signal(|| String::new());
@@ -205,7 +209,7 @@ pub fn ViewReport(
 
             div { class: "middle-section",
                 div { class: "sidebar",
-                    button { class: "btn-classic", onclick: move |evt| on_back.call(evt), "🏠 Voltar" }
+                    button { class: "btn-classic", onclick: move |evt| { engine.write().clear_memory(); on_back.call(evt)}, "🏠 Voltar" }
                     button { class: "btn-classic", onclick: export_csv, "💾 Exportar CSV" }
                     button { class: "btn-classic", onclick: export_xlsx, "📊 Exportar Excel" }
                 }

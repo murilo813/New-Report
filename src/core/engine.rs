@@ -7,7 +7,6 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use dotenvy::dotenv;
 use encoding_rs::WINDOWS_1252;
-use std::os::windows::fs::OpenOptionsExt;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
@@ -16,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -265,20 +265,29 @@ impl DataEngine {
                 }
                 WorkerMsg::TableDone(table_name) => {
                     let start_registro = std::time::Instant::now();
-                    
+
                     if let Some(batches) = table_batches.remove(&table_name) {
                         if !batches.is_empty() {
                             let schema = batches[0].schema();
                             match MemTable::try_new(schema, vec![batches]) {
                                 Ok(mem_table) => {
-                                    if let Err(e) = self.ctx.register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table)) {
-                                        final_error = Some(format!("Erro ao registrar tabela {}: {}", table_name, e));
+                                    if let Err(e) = self.ctx.register_table(
+                                        table_name.to_lowercase().as_str(),
+                                        Arc::new(mem_table),
+                                    ) {
+                                        final_error = Some(format!(
+                                            "Erro ao registrar tabela {}: {}",
+                                            table_name, e
+                                        ));
                                         cancel_flag.store(true, Ordering::SeqCst);
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    final_error = Some(format!("Erro ao mapear MemTable da {}: {}", table_name, e));
+                                    final_error = Some(format!(
+                                        "Erro ao mapear MemTable da {}: {}",
+                                        table_name, e
+                                    ));
                                     cancel_flag.store(true, Ordering::SeqCst);
                                     break;
                                 }
@@ -303,7 +312,7 @@ impl DataEngine {
             let _ = h.join();
         }
 
-        on_progress(100.0); 
+        on_progress(100.0);
 
         let tempo_total = start_carga.elapsed().as_millis();
         let tempo_extracao = tempo_total.saturating_sub(tempo_registro);
@@ -377,7 +386,9 @@ impl DataEngine {
 
                 Ok((cols, total_rows))
             })
-        }).join().unwrap_or(Err("Erro crítico na thread do SQL".into()));
+        })
+        .join()
+        .unwrap_or(Err("Erro crítico na thread do SQL".into()));
 
         let tempo_sql = start_sql.elapsed().as_millis();
         append_log(report_name, "3. Execução SQL (DataFusion)", tempo_sql);
@@ -392,7 +403,7 @@ impl DataEngine {
 
         for batch in cache.iter() {
             let num_rows = batch.num_rows();
-            
+
             if current_idx + num_rows <= offset {
                 current_idx += num_rows;
                 continue;
@@ -404,19 +415,32 @@ impl DataEngine {
                     let mut row_data = Vec::with_capacity(num_cols);
                     for col_idx in 0..num_cols {
                         let array = batch.column(col_idx);
-                        let val_str = datafusion::arrow::util::display::array_value_to_string(
-                            array, row_idx,
-                        ).unwrap_or_default();
+                        let val_str =
+                            datafusion::arrow::util::display::array_value_to_string(array, row_idx)
+                                .unwrap_or_default();
                         row_data.push(val_str);
                     }
                     rows_vec.push(row_data);
                 }
                 current_idx += 1;
-                if rows_vec.len() >= limit { break; }
+                if rows_vec.len() >= limit {
+                    break;
+                }
             }
-            if rows_vec.len() >= limit { break; }
+            if rows_vec.len() >= limit {
+                break;
+            }
         }
         rows_vec
+    }
+
+    pub fn clear_memory(&mut self) {
+        self.ctx = SessionContext::new();
+
+        if let Ok(mut cache) = self.cached_results.lock() {
+            cache.clear();
+            cache.shrink_to_fit();
+        }
     }
 }
 
@@ -432,7 +456,7 @@ fn parse_dbisam_table(
     let dat_path = format!(r"{}/{}.dat", base_path, table_name);
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN) 
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
         .open(&dat_path)
         .map_err(|e| format!("Erro ao abrir {}: {}", dat_path, e))?;
 
@@ -557,7 +581,7 @@ fn parse_dbisam_table(
     })?;
 
     if !cancel.load(Ordering::SeqCst) {
-        let _ = tx.send(WorkerMsg::TableDone(table_name)); 
+        let _ = tx.send(WorkerMsg::TableDone(table_name));
     }
 
     Ok(())
@@ -577,7 +601,7 @@ fn create_builders_from_cols(target_columns: &[Column], capacity: usize) -> Vec<
             "F" => ColBuilder::Float(Float64Builder::with_capacity(capacity)),
             "D" => ColBuilder::Date(Date32Builder::with_capacity(capacity)),
             _ => {
-                let estimated_bytes = capacity * 15; 
+                let estimated_bytes = capacity * 15;
                 ColBuilder::Text(StringBuilder::with_capacity(capacity, estimated_bytes))
             }
         })

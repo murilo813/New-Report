@@ -5,11 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
-use std::sync::Arc;
-
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct ReportParameter {
     pub id: String,
@@ -231,6 +226,7 @@ pub fn EditQuery(
 
     let handle_test = move |_| {
         let sql = query_text.read().clone();
+        let params_list = parameters.read().clone();
 
         if !sql.to_uppercase().contains("[SYNC:") {
             status_msg.set("ERRO: Tag [SYNC: ...] não encontrada na query.".to_string());
@@ -239,21 +235,37 @@ pub fn EditQuery(
             return;
         }
 
-        let schema_map = engine.read().schema.clone();
-
-        let test_ctx = datafusion::prelude::SessionContext::new();
-
         let re_header = regex::Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
         let re_table = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\((.*?)\)").unwrap();
 
-        let mut tables_to_mock = Vec::new();
-        if let Some(content) = re_header.captures(&sql).and_then(|caps| caps.get(1)) {
-            for cap in re_table.captures_iter(content.as_str()) {
-                tables_to_mock.push(cap[1].to_string().to_lowercase());
+        let mut specific_configs = std::collections::HashMap::new();
+        {
+            let engine_lock = engine.read();
+
+            if let Some(content) = re_header.captures(&sql).and_then(|caps| caps.get(1)) {
+                for cap in re_table.captures_iter(content.as_str()) {
+                    let table_name = cap[1].to_string().to_lowercase();
+
+                    if let Some((_, config)) = engine_lock
+                        .schema
+                        .iter()
+                        .find(|(k, _)| k.to_lowercase() == table_name)
+                    {
+                        specific_configs.insert(table_name.clone(), config.clone());
+                    } else {
+                        status_msg.set(format!(
+                            "Tabela '{}' não existe no arquivo schema.toml!",
+                            table_name
+                        ));
+                        status_modal_type.set(StatusType::Error);
+                        show_status_modal.set(true);
+                        return;
+                    }
+                }
             }
         }
 
-        if tables_to_mock.is_empty() {
+        if specific_configs.is_empty() {
             status_msg.set(
                 "Tag SYNC encontrada, mas nenhuma tabela foi declarada corretamente.".to_string(),
             );
@@ -262,49 +274,13 @@ pub fn EditQuery(
             return;
         }
 
-        for table_name in tables_to_mock {
-            match schema_map
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == table_name)
-            {
-                Some((_, config)) => {
-                    let mut arrow_fields = Vec::new();
-                    for col in &config.columns {
-                        let dtype = match col.field_type.as_str() {
-                            "I" => DataType::Int64,
-                            "F" => DataType::Float64,
-                            "D" => DataType::Date32,
-                            _ => DataType::Utf8,
-                        };
-                        arrow_fields.push(Field::new(&col.name.to_lowercase(), dtype, true));
-                    }
-                    let schema = Arc::new(ArrowSchema::new(arrow_fields));
-                    let empty_batch = RecordBatch::new_empty(schema.clone());
-                    let mem_table = MemTable::try_new(schema, vec![vec![empty_batch]]).unwrap();
-
-                    test_ctx
-                        .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
-                        .unwrap();
-                }
-                None => {
-                    status_msg.set(format!(
-                        "Tabela '{}' não existe no arquivo schema.toml!",
-                        table_name
-                    ));
-                    status_modal_type.set(StatusType::Error);
-                    show_status_modal.set(true);
-                    return;
-                }
-            }
-        }
-
         let clean_sql_str = re_header.replace_all(&sql, "").to_string();
         let re_vars = regex::Regex::new(r"\[([a-zA-Z0-9_]+)\]").unwrap();
         let mut final_sql = clean_sql_str;
 
         for cap in re_vars.captures_iter(&final_sql.clone()) {
             let var_id = cap[1].to_string();
-            if let Some(param) = parameters.read().iter().find(|p| p.id == var_id) {
+            if let Some(param) = params_list.iter().find(|p| p.id == var_id) {
                 if param.valor_padrao.trim().is_empty() {
                     status_msg.set(format!("Erro de Validação: A variável '[{}]' está no SQL, mas o 'Valor Padrão' dela está vazio.", var_id));
                     status_modal_type.set(StatusType::Error);
@@ -328,55 +304,76 @@ pub fn EditQuery(
             return;
         }
 
-        let test_result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                for cmd in commands {
-                    if let Err(e) = test_ctx.sql(&cmd).await {
-                        return Err(e.to_string());
+        spawn(async move {
+            let test_ctx = datafusion::prelude::SessionContext::new();
+
+            for (table_name, config) in specific_configs {
+                let mut arrow_fields = Vec::new();
+                for col in &config.columns {
+                    let dtype = match col.field_type.as_str() {
+                        "I" => datafusion::arrow::datatypes::DataType::Int64,
+                        "F" => datafusion::arrow::datatypes::DataType::Float64,
+                        "D" => datafusion::arrow::datatypes::DataType::Date32,
+                        _ => datafusion::arrow::datatypes::DataType::Utf8,
+                    };
+                    arrow_fields.push(datafusion::arrow::datatypes::Field::new(
+                        &col.name.to_lowercase(),
+                        dtype,
+                        true,
+                    ));
+                }
+                let schema =
+                    std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(arrow_fields));
+                let empty_batch =
+                    datafusion::arrow::record_batch::RecordBatch::new_empty(schema.clone());
+                let mem_table =
+                    datafusion::datasource::MemTable::try_new(schema, vec![vec![empty_batch]])
+                        .unwrap();
+
+                let _ =
+                    test_ctx.register_table(table_name.as_str(), std::sync::Arc::new(mem_table));
+            }
+
+            let mut final_result = Ok(());
+            for cmd in commands {
+                if let Err(e) = test_ctx.sql(&cmd).await {
+                    final_result = Err(e.to_string());
+                    break;
+                }
+            }
+
+            match final_result {
+                Ok(_) => {
+                    status_msg.set("SQL Validado com Sucesso!\n\nA sintaxe e as colunas foram aprovadas pelo DataFusion.".to_string());
+                    status_modal_type.set(StatusType::Success);
+                }
+                Err(e) => {
+                    let mut clean_error = e.clone();
+
+                    if let Some(idx) = clean_error.find("Valid fields are") {
+                        clean_error = clean_error[..idx].to_string();
                     }
-                }
-                Ok(())
-            })
-        })
-        .join()
-        .unwrap_or_else(|_| Err("Erro crítico ao inicializar ambiente de teste SQL.".to_string()));
+                    if let Some(idx) = clean_error.find("Did you mean") {
+                        clean_error = clean_error[..idx].to_string();
+                    }
 
-        match test_result {
-            Ok(_) => {
-                status_msg.set("SQL Validado com Sucesso!\n\nA sintaxe e as colunas foram aprovadas pelo DataFusion.".to_string());
-                status_modal_type.set(StatusType::Success);
-                show_status_modal.set(true);
+                    let clean_error = clean_error.trim().to_string();
+
+                    let final_msg = if clean_error.is_empty() {
+                        "Erro de sintaxe SQL ou coluna não encontrada.\n(Verifique o uso de maiúsculas e minúsculas)".to_string()
+                    } else {
+                        format!(
+                            "{}\n\n💡 Dica: Verifique se os nomes das colunas estão corretos no 'schema.toml' e se todos os JOINs possuem as colunas de ligação.",
+                            clean_error
+                        )
+                    };
+
+                    status_msg.set(final_msg);
+                    status_modal_type.set(StatusType::Error);
+                }
             }
-            Err(e) => {
-                let mut clean_error = e.clone();
-
-                if let Some(idx) = clean_error.find("Valid fields are") {
-                    clean_error = clean_error[..idx].to_string();
-                }
-                if let Some(idx) = clean_error.find("Did you mean") {
-                    clean_error = clean_error[..idx].to_string();
-                }
-
-                let clean_error = clean_error.trim().to_string();
-
-                let final_msg = if clean_error.is_empty() {
-                    "Erro de sintaxe SQL ou coluna não encontrada.\n(Verifique o uso de maiúsculas e minúsculas)".to_string()
-                } else {
-                    format!(
-                        "{}\n\n💡 Dica: Verifique se os nomes das colunas estão corretos no 'schema.toml' e se todos os JOINs possuem as colunas de ligação.",
-                        clean_error
-                    )
-                };
-
-                status_msg.set(final_msg);
-                status_modal_type.set(StatusType::Error);
-                show_status_modal.set(true);
-            }
-        }
+            show_status_modal.set(true);
+        });
     };
 
     let report_name_original = report_name.clone();
