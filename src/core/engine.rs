@@ -11,10 +11,10 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::sync::{
     Arc, Mutex,
@@ -441,6 +441,43 @@ impl DataEngine {
             cache.clear();
             cache.shrink_to_fit();
         }
+    }
+
+    pub fn start_background_warming(base_path: String, reports_dir: String) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            let mut unique_tables = HashSet::new();
+            let re_sync = Regex::new(r"(?i)\[SYNC:\s*(?s)(.*?)\]").unwrap();
+            let re_table = Regex::new(r"([a-zA-Z0-9_]+)\s*\(").unwrap();
+
+            if let Ok(entries) = std::fs::read_dir(&reports_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                            for cap_sync in re_sync.captures_iter(&content) {
+                                for cap_table in re_table.captures_iter(&cap_sync[1]) {
+                                    unique_tables.insert(cap_table[1].to_string().to_lowercase());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if unique_tables.is_empty() { return; }
+
+            for table in unique_tables {
+                let path = format!(r"{}\{}.dat", base_path, table);
+                if let Ok(mut file) = File::open(&path) {
+                    let mut buffer = vec![0u8; 8 * 1024 * 1024]; 
+                    while let Ok(n) = file.read(&mut buffer) {
+                        if n == 0 { break; }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
     }
 }
 

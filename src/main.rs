@@ -62,6 +62,11 @@ fn App() -> Element {
 
             match engine_result {
                 Ok(loaded_engine) => {
+                    DataEngine::start_background_warming(
+                        loaded_engine.base_path.clone(),
+                        "relatorios".to_string()
+                    );
+
                     engine_signal.set(loaded_engine);
                     is_loaded.set(true);
                 }
