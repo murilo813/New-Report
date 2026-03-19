@@ -56,6 +56,7 @@ enum WorkerMsg {
         batch: RecordBatch,
         processed_count: usize,
     },
+    TableDone(String),
     Error(String),
 }
 
@@ -251,18 +252,38 @@ impl DataEngine {
                     batch,
                     processed_count,
                 } => {
-                    let start_registro = std::time::Instant::now();
-
                     table_batches
                         .entry(table_name)
                         .or_insert_with(Vec::new)
                         .push(batch);
 
-                    tempo_registro += start_registro.elapsed().as_millis();
-
                     total_processed += processed_count;
                     let progress_percent = (total_processed as f32 / total_rows_f32) * 100.0;
-                    on_progress(progress_percent.min(100.0));
+                    on_progress(progress_percent.min(99.0));
+                }
+                WorkerMsg::TableDone(table_name) => {
+                    let start_registro = std::time::Instant::now();
+                    
+                    if let Some(batches) = table_batches.remove(&table_name) {
+                        if !batches.is_empty() {
+                            let schema = batches[0].schema();
+                            match MemTable::try_new(schema, vec![batches]) {
+                                Ok(mem_table) => {
+                                    if let Err(e) = self.ctx.register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table)) {
+                                        final_error = Some(format!("Erro ao registrar tabela {}: {}", table_name, e));
+                                        cancel_flag.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    final_error = Some(format!("Erro ao mapear MemTable da {}: {}", table_name, e));
+                                    cancel_flag.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    tempo_registro += start_registro.elapsed().as_millis();
                 }
                 WorkerMsg::Error(e) => {
                     final_error = Some(e);
@@ -280,17 +301,7 @@ impl DataEngine {
             let _ = h.join();
         }
 
-        for (table_name, batches) in table_batches {
-            if !batches.is_empty() {
-                let schema = batches[0].schema();
-                let mem_table = MemTable::try_new(schema, vec![batches])
-                    .map_err(|e| format!("Erro ao mapear MemTable: {}", e))?;
-
-                self.ctx
-                    .register_table(table_name.to_lowercase().as_str(), Arc::new(mem_table))
-                    .map_err(|e| format!("Erro ao registrar tabela {}: {}", table_name, e))?;
-            }
-        }
+        on_progress(100.0); 
 
         let tempo_total = start_carga.elapsed().as_millis();
         let tempo_extracao = tempo_total.saturating_sub(tempo_registro);
@@ -311,7 +322,6 @@ impl DataEngine {
 
         Ok(())
     }
-
     pub fn execute_user_sql(
         &self,
         sql: &str,
@@ -423,6 +433,9 @@ fn parse_dbisam_table(
     let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
 
     if mmap.len() < DBISAM_HEADER_MIN_LEN {
+        if !cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::TableDone(table_name));
+        }
         return Ok(());
     }
 
@@ -470,7 +483,6 @@ fn parse_dbisam_table(
     }
 
     let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
-
     let row_indexes: Vec<u32> = (0..total_rows_expected).collect();
 
     row_indexes.par_chunks(CHUNK_SIZE).try_for_each(|chunk| {
@@ -551,6 +563,10 @@ fn parse_dbisam_table(
         Ok(())
     })?;
 
+    if !cancel.load(Ordering::SeqCst) {
+        let _ = tx.send(WorkerMsg::TableDone(table_name)); 
+    }
+
     Ok(())
 }
 
@@ -615,5 +631,6 @@ pub fn append_log(report_name: &str, stage: &str, duration_ms: u128) {
         .open("logs_desempenho.txt")
     {
         let _ = file.write_all(log_line.as_bytes());
+        let _ = file.sync_all();
     }
 }
