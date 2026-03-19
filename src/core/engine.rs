@@ -7,6 +7,7 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use dotenvy::dotenv;
 use encoding_rs::WINDOWS_1252;
+use std::os::windows::fs::OpenOptionsExt;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
@@ -21,6 +22,7 @@ use std::sync::{
     mpsc,
 };
 
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x40000000;
 const DBISAM_HEADER_MIN_LEN: usize = 512;
 const DBISAM_OFFSET_TOTAL_ROWS: std::ops::Range<usize> = 0x29..0x2D;
 const DBISAM_OFFSET_TOTAL_FIELDS: std::ops::Range<usize> = 0x2F..0x31;
@@ -428,7 +430,11 @@ fn parse_dbisam_table(
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let dat_path = format!(r"{}/{}.dat", base_path, table_name);
-    let file = File::open(&dat_path).map_err(|e| format!("Erro ao abrir {}: {}", dat_path, e))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN) 
+        .open(&dat_path)
+        .map_err(|e| format!("Erro ao abrir {}: {}", dat_path, e))?;
 
     let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
 
